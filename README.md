@@ -1,7 +1,8 @@
 # WhopClip — automated Whop Content Rewards clipper (Android + control plane)
 
 Production status: **live**. Server: https://whopclip.vercel.app (Vercel, `raj3kk/whopclip`, root `server/`).
-Android: `com.whopclip.agent`, release-signed APK (see below).
+Android: `com.whopclip.agent` v1.0.0 (versionCode 2), release-signed APK:
+**https://whopclip.vercel.app/whopclip-v2.apk**
 
 > This is a brand-new project. It is NOT related to the deleted ClipFlow/AutoClip.
 
