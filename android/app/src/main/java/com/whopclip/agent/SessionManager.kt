@@ -26,8 +26,20 @@ object SessionManager {
     private const val KEY_IG_DONE = "ig_done"
     private const val KEY_PAIRED = "paired"
 
-    // TODO: replace with the real deployed server URL (Vercel).
+    // Deployed production server (Vercel). Override-able from the app's server field.
     private const val DEFAULT_SERVER_URL = "https://whopclip.vercel.app"
+
+    /**
+     * APK's real versionCode from PackageManager (build-apk.sh generates no
+     * BuildConfig.java, so this is read at runtime). Sent as app_version on
+     * pairing + job claims so the dashboard shows the running build.
+     */
+    @Suppress("DEPRECATION")
+    fun appVersionCode(ctx: Context): String = try {
+        val pi = ctx.packageManager.getPackageInfo(ctx.packageName, 0)
+        if (Build.VERSION.SDK_INT >= 28) pi.longVersionCode.toString()
+        else pi.versionCode.toString()
+    } catch (_: Exception) { "3" }
 
     private fun prefs(ctx: Context): SharedPreferences =
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -66,7 +78,7 @@ object SessionManager {
                     put("action", "claim")
                     put("code", clean)
                     put("device_id", deviceId(ctx))
-                    put("app_version", "3")
+                    put("app_version", appVersionCode(ctx))
                     put("device_model", "${Build.MANUFACTURER} ${Build.MODEL}")
                 }
                 val conn = (URL("${serverUrl(ctx)}/api/pair").openConnection() as HttpURLConnection).apply {

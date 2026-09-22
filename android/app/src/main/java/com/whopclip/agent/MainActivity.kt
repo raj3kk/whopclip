@@ -1,11 +1,16 @@
 package com.whopclip.agent
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -19,6 +24,11 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private lateinit var serverInput: EditText
+    private lateinit var pairInput: EditText
+
+    companion object {
+        private const val REQ_NOTIFICATIONS = 1001
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -26,12 +36,23 @@ class MainActivity : AppCompatActivity() {
 
         statusText = findViewById(R.id.statusText)
         serverInput = findViewById(R.id.serverInput)
+        pairInput = findViewById(R.id.pairInput)
         val whopBtn: Button = findViewById(R.id.whopLoginBtn)
         val igBtn: Button = findViewById(R.id.igLoginBtn)
         val saveBtn: Button = findViewById(R.id.saveServerBtn)
         val startBtn: Button = findViewById(R.id.startBtn)
-        val pairInput: EditText = findViewById(R.id.pairInput)
         val pairBtn: Button = findViewById(R.id.pairBtn)
+
+        // Android 13+: PollWorker's notifications (upload-ready prompt) are
+        // silently dropped without this runtime grant. Ask once up front.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS
+            )
+        }
 
         serverInput.setText(SessionManager.serverUrl(this))
 
@@ -49,6 +70,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
         startBtn.setOnClickListener {
+            // Pairing gate: unpaired phone must not start polling.
+            if (!SessionManager.isPaired(this)) {
+                Toast.makeText(this, "Pehle pairing code se phone pair karo (website /connect se)",
+                    Toast.LENGTH_LONG).show()
+                pairInput.requestFocus()
+                return@setOnClickListener
+            }
             if (!SessionManager.isWhopLinked(this) || !SessionManager.isIgLinked(this)) {
                 Toast.makeText(this, "Pehle Whop + Instagram dono me login karo",
                     Toast.LENGTH_LONG).show()

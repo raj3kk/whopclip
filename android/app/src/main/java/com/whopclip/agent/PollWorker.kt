@@ -30,6 +30,11 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
+            // Pairing gate: unpaired phone must not touch the server queue.
+            if (!SessionManager.isPaired(applicationContext)) {
+                Log.i(TAG, "unpaired device — polling skipped")
+                return@withContext Result.success()
+            }
             ensureSessionsOnServer()
             val job = claimJob() ?: return@withContext Result.success()
             Log.i(TAG, "claimed job ${job.optString("id")} type=${job.optString("type")}")
@@ -87,7 +92,8 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
         }
     }
 
-    private fun api(path: String, method: String = "GET", body: JSONObject? = null): JSONObject? {
+    private fun api(path: String, method: String = "GET", body: JSONObject? = null,
+                    throwOnError: Boolean = false): JSONObject? {
         val conn = (URL("${SessionManager.serverUrl(applicationContext)}$path").openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 20000; readTimeout = 20000
@@ -98,17 +104,29 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
         }
         return try {
             if (body != null) conn.outputStream.bufferedWriter().use { it.write(body.toString()) }
-            if (conn.responseCode == 204) null
-            else JSONObject(conn.inputStream.bufferedReader().readText())
+            val code = conn.responseCode
+            if (code == 204) null // genuine empty queue — success
+            else if (code !in 200..299) {
+                // Transport/HTTP error — NOT an empty queue. Caller decides;
+                // claimJob rethrows so doWork() returns Result.retry().
+                Log.w(TAG, "api $path failed: HTTP $code")
+                if (throwOnError) throw java.io.IOException("api $path: HTTP $code")
+                null
+            } else JSONObject(conn.inputStream.bufferedReader().readText())
         } catch (e: Exception) {
             Log.w(TAG, "api $path failed: ${e.message}")
+            if (throwOnError) throw e
             null
         } finally { conn.disconnect() }
     }
 
     private fun claimJob(): JSONObject? {
         val deviceId = SessionManager.deviceId(applicationContext)
-        return api("/api/jobs/next?device_id=$deviceId")?.optJSONObject("job")
+        val appV = SessionManager.appVersionCode(applicationContext)
+        val model = java.net.URLEncoder.encode(
+            "${Build.MANUFACTURER} ${Build.MODEL}", "UTF-8")
+        return api("/api/jobs/next?device_id=$deviceId&app_version=$appV&device_model=$model",
+            throwOnError = true)?.optJSONObject("job")
     }
 
     private fun reportJob(id: String, status: String, result: JSONObject) {

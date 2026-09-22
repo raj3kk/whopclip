@@ -11,6 +11,7 @@ import {
   type JobStatus,
   type ServiceName,
 } from "@/lib/store";
+import { verifyAuthToken, AUTH_COOKIE } from "@/lib/auth";
 import crypto from "crypto";
 
 /**
@@ -26,6 +27,11 @@ import crypto from "crypto";
  */
 export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
   if (params.id === "enqueue") {
+    // Orchestrator-only: owner dashboard uses authed /api/run; raw HTTP
+    // enqueue must not be callable by the phone or anyone else.
+    if (!verifyAuthToken(req.cookies.get(AUTH_COOKIE)?.value)) {
+      return NextResponse.json({ error: "login required" }, { status: 401 });
+    }
     try {
       const body = await req.json();
       const { device_id, type, steps } = body ?? {};
@@ -76,8 +82,17 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     if (!job) return NextResponse.json({ error: "job not found" }, { status: 404 });
 
     // Checkpoints 1+9: successful Whop submit -> earnings ledger (dup-proof).
+    // campaign_id usually comes from the phone's extract result, but the
+    // orchestrator also stamps it on the job — fall back to the job field
+    // so submissions are recorded (and alreadySubmitted() works) even when
+    // the phone doesn't send campaign_id back.
     if (job.type === "whop_submit" && status === "done") {
-      const campaign_id = typeof r.campaign_id === "string" ? r.campaign_id : "";
+      const campaign_id =
+        typeof r.campaign_id === "string" && r.campaign_id
+          ? r.campaign_id
+          : typeof job.campaign_id === "string"
+            ? job.campaign_id
+            : "";
       const ig_post_url = typeof r.ig_post_url === "string" ? r.ig_post_url : "";
       if (campaign_id && ig_post_url && !(await alreadySubmitted(job.device_id, campaign_id))) {
         const camp = await getCampaign(campaign_id);

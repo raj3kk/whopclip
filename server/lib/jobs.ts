@@ -68,9 +68,18 @@ export interface IgPostParams {
   caption: string;
   /** local path/URI hint shown to the foreground picker (JobRunnerActivity) */
   video_hint?: string;
+  /**
+   * If the post URL is already known (re-verify / retry), the verify step
+   * goes straight to it. Otherwise the step uses the "__POST_URL__"
+   * placeholder, which the phone's JobEngine substitutes with the extracted
+   * `post_url` at runtime.
+   */
+  post_url?: string;
 }
 
 export function igPostJob(p: IgPostParams): Step[] {
+  const verifyUrl =
+    p.post_url && /^https?:\/\//i.test(p.post_url) ? p.post_url : "__POST_URL__";
   return [
     { action: "goto", url: "https://www.instagram.com/" },
     { action: "wait", ms: 2500 },
@@ -97,7 +106,7 @@ export function igPostJob(p: IgPostParams): Step[] {
         return a||location.href;
       })()`,
     },
-    { action: "goto", url: "__POST_URL__" },
+    { action: "goto", url: verifyUrl },
     { action: "wait", ms: 4000 },
     {
       action: "assert_text",

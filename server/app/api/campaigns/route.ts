@@ -7,6 +7,7 @@ import {
   upsertCampaign,
   type Campaign,
 } from "@/lib/store";
+import { verifyAuthToken, AUTH_COOKIE } from "@/lib/auth";
 
 /**
  * GET  /api/campaigns?device_id=... -> campaign list for this device
@@ -42,6 +43,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ campaign });
     }
     if (body?.action === "upsert") {
+      // Owner write operation: campaign create/update requires owner login.
+      if (!verifyAuthToken(req.cookies.get(AUTH_COOKIE)?.value)) {
+        return NextResponse.json({ error: "login required" }, { status: 401 });
+      }
       const c = body.campaign as Partial<Campaign>;
       if (!c?.id || !c?.name || !c?.whop_url) {
         return NextResponse.json(

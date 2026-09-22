@@ -12,8 +12,8 @@ BT="$SDK/build-tools/34.0.0"
 PLATFORM="$SDK/platforms/android-34/android.jar"
 KOTLINC="$HOME/workspace/.kotlin/kotlinc/bin/kotlinc"
 
-VERSION_CODE="${VERSION_CODE:-3}"
-VERSION_NAME="${VERSION_NAME:-1.0.1}"
+VERSION_CODE="${VERSION_CODE:-4}"
+VERSION_NAME="${VERSION_NAME:-1.0.2}"
 APP_ID="com.whopclip.agent"
 
 rm -rf "$OUT"
@@ -105,6 +105,8 @@ STOREPW="$(cat "$HOME/.config/whopclip/keystore.pw")"
   --out "$OUT/apk/whopclip-v${VERSION_CODE}.apk" "$OUT/apk/aligned.apk"
 
 echo "== 9. verify =="
-"$BT/apksigner" verify --print-certs "$OUT/apk/whopclip-v${VERSION_CODE}.apk" | head -6
-"$BT/aapt2" dump badging "$OUT/apk/whopclip-v${VERSION_CODE}.apk" | head -3
+"$BT/apksigner" verify --print-certs "$OUT/apk/whopclip-v${VERSION_CODE}.apk" > "$OUT/verify-certs.txt"
+head -6 "$OUT/verify-certs.txt"
+"$BT/aapt2" dump badging "$OUT/apk/whopclip-v${VERSION_CODE}.apk" > "$OUT/verify-badging.txt"
+head -3 "$OUT/verify-badging.txt"
 ls -la "$OUT/apk/whopclip-v${VERSION_CODE}.apk"

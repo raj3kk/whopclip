@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -118,10 +119,17 @@ class JobRunnerActivity : AppCompatActivity() {
                         Toast.makeText(this@JobRunnerActivity, "Job complete ✓", Toast.LENGTH_SHORT).show()
                     }
                 } catch (e: Exception) {
-                    reportJob(job.getString("id"), "failed",
+                    // needs_foreground = job is still valid, just needs the app
+                    // open — requeue it (server accepts status "requeue") instead
+                    // of losing it as "failed", mirroring PollWorker.
+                    val needsFg = e is JobEngine.JobFailed &&
+                        (e.message ?: "").startsWith("needs_foreground")
+                    val status = if (needsFg) "requeue" else "failed"
+                    reportJob(job.getString("id"), status,
                         JSONObject().put("error", e.message ?: "unknown"))
+                    if (needsFg) Log.w("JobRunner", "job requeued: ${e.message}")
                     runOnUiThread {
-                        statusText.text = "Job fail: ${e.message}"
+                        statusText.text = if (needsFg) "Job queue me wapas ✓" else "Job fail: ${e.message}"
                         progress.visibility = View.GONE
                     }
                 }
@@ -136,7 +144,11 @@ class JobRunnerActivity : AppCompatActivity() {
 
     private fun claimJob(): JSONObject? {
         val deviceId = SessionManager.deviceId(this)
-        val url = "${SessionManager.serverUrl(this)}/api/jobs/next?device_id=$deviceId"
+        val appV = SessionManager.appVersionCode(this)
+        val model = java.net.URLEncoder.encode(
+            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}", "UTF-8")
+        val url = "${SessionManager.serverUrl(this)}/api/jobs/next" +
+            "?device_id=$deviceId&app_version=$appV&device_model=$model"
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 20000; readTimeout = 20000
         }

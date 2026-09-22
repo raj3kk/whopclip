@@ -57,7 +57,7 @@ class JobEngine(private val ctx: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /** Video URI pre-downloaded from the job's video_url (auto-supplied to file inputs). */
-    private var pendingVideoUri: Uri? = null
+    @Volatile private var pendingVideoUri: Uri? = null
 
     /**
      * Called by JobRunnerActivity.onShowFileChooser. Returns true if the engine
@@ -188,12 +188,27 @@ class JobEngine(private val ctx: Context) {
             try {
                 // Pre-download the orchestrator-provided video so file inputs can
                 // be auto-filled without the system picker (see handleFileChooser).
-                pendingVideoUri = prepareUploadVideo(job)
+                // Only when the job actually has an upload step — skip the
+                // download for pure browsing/click jobs.
+                val needsUpload = (0 until steps.length()).any {
+                    steps.getJSONObject(it).optString("action") == "upload"
+                }
+                pendingVideoUri = if (needsUpload) prepareUploadVideo(job) else null
                 for (i in 0 until steps.length()) {
                     val s = steps.getJSONObject(i)
                     when (s.optString("action")) {
                         "goto" -> {
-                            val url = s.getString("url")
+                            var url = s.getString("url")
+                            // "__POST_URL__" placeholder: substitute the post_url
+                            // extracted earlier by an `extract` step (see igPostJob).
+                            // Fail closed: never navigate to the literal placeholder.
+                            if (url.contains("__POST_URL__")) {
+                                val real = extracted.optString("post_url", "")
+                                if (real.isBlank() || real == "__POST_URL__")
+                                    throw JobFailed("goto: __POST_URL__ placeholder unresolved — post_url not extracted yet")
+                                url = url.replace("__POST_URL__", real)
+                            }
+                            val target = url
                             val latch = java.util.concurrent.CountDownLatch(1)
                             mainHandler.post {
                                 wv.webViewClient = object : WebViewClient() {
@@ -201,10 +216,10 @@ class JobEngine(private val ctx: Context) {
                                         latch.countDown()
                                     }
                                 }
-                                wv.loadUrl(url)
+                                wv.loadUrl(target)
                             }
                             if (!latch.await(45, java.util.concurrent.TimeUnit.SECONDS))
-                                throw JobFailed("goto timeout: $url")
+                                throw JobFailed("goto timeout: $target")
                             kotlinx.coroutines.delay(1500)
                         }
                         "wait" -> kotlinx.coroutines.delay(s.optLong("ms", 2000))
@@ -267,6 +282,15 @@ class JobEngine(private val ctx: Context) {
                             extracted.put(key, r.trim('"'))
                         }
                         "upload" -> {
+                            // Headless PollWorker has no activity/file-picker: fail
+                            // fast so the job is requeued and the user is notified
+                            // (no pointless 90s wait here).
+                            if (ownsWebView)
+                                throw JobFailed("needs_foreground: upload needs the app open (file picker)")
+                            // Arm BEFORE the JS click: the auto-supply path in
+                            // onShowFileChooser -> handleFileChooser signals the
+                            // latch that awaitFile() is waiting on.
+                            UploadBridge.arm()
                             val sel = s.optString("selector", "input[type=file]").replace("'", "\\'")
                             val r = evalJs(
                                 wv,
@@ -275,7 +299,7 @@ class JobEngine(private val ctx: Context) {
                             if (r.trim('"') != "clicked")
                                 throw JobFailed("upload: file input not found ($sel)")
                             // JobRunnerActivity's onShowFileChooser shows the picker and
-                            // signals UploadBridge. Headless (no activity) -> requeue.
+                            // signals UploadBridge. If the picker never fires -> requeue.
                             if (!UploadBridge.awaitFile(90000))
                                 throw JobFailed("needs_foreground: upload needs the app open (file picker)")
                             kotlinx.coroutines.delay(2000)

@@ -65,6 +65,10 @@ export interface Job {
   type: string;
   status: JobStatus;
   steps: JobStep[];
+  /** arbitrary per-job inputs, e.g. { video_url } for ig_post (read by phone JobEngine) */
+  payload?: Record<string, unknown>;
+  /** campaign this job belongs to (set by orchestrator; fallback for submission recording) */
+  campaign_id?: string;
   result: unknown;
   created_at: string;
   updated_at: string;

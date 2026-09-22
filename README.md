@@ -2,7 +2,7 @@
 
 Production status: **live**. Server: https://whopclip.vercel.app (Vercel, `raj3kk/whopclip`, root `server/`).
 Android: `com.whopclip.agent` v1.0.0 (versionCode 2), release-signed APK:
-**https://whopclip.vercel.app/whopclip-v3.apk**
+**https://whopclip.vercel.app/whopclip-v4.apk**
 
 > This is a brand-new project. It is NOT related to the deleted ClipFlow/AutoClip.
 
@@ -39,6 +39,14 @@ Android: `com.whopclip.agent` v1.0.0 (versionCode 2), release-signed APK:
 | `SESSION_MASTER_KEY` | 64-hex key for AES-256-GCM session encryption (set) |
 | `SUPABASE_SERVICE_ROLE_KEY` | durable state in `flipify_kv` (`whopclip:*` keys). **Not set yet** — without it the server uses ephemeral in-memory state (works, but jobs/sessions don't survive cold starts). Set via a secure capture flow, then redeploy. |
 | `SUPABASE_URL` | defaults to the project's Supabase host; override only if it moves |
+| `CRON_SECRET` | random secret (e.g. `openssl rand -hex 32`) for `GET /api/schedule/tick`; Vercel cron hits it every 15 min via `server/vercel.json`. Without it the schedule runner returns 503 and scheduled runs never fire. |
+
+### Schedule cron
+
+`server/vercel.json` runs `GET /api/schedule/tick` every 15 minutes. The route
+requires the `x-cron-secret` header to equal `CRON_SECRET`. For every registered
+device whose schedule is due it enqueues a `check` run and marks the schedule
+so it fires once per day. This is the source of truth for scheduled automation.
 
 State is namespaced `whopclip:*` inside the existing `flipify_kv` table — no new
 tables, no SQL migrations.
