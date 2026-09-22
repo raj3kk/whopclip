@@ -119,16 +119,23 @@ class LoginActivity : Activity() {
         statusText.text = "Session save ho raha hai…"
         val url = webView.url ?: if (service == "whop") "https://whop.com/" else "https://www.instagram.com/"
         CoroutineScope(Dispatchers.Main).launch {
-            val ok = SessionManager.uploadSession(this@LoginActivity, service, url)
-            if (ok) {
+            val result = SessionManager.uploadSession(this@LoginActivity, service, url)
+            if (result is SessionManager.UploadResult.Success) {
                 Toast.makeText(this@LoginActivity, "Login save ho gaya ✓", Toast.LENGTH_SHORT).show()
                 setResult(RESULT_OK)
                 finish()
             } else {
                 uploaded = false
                 doneButton.isEnabled = true
-                statusText.text = "Session save nahi hua — dobara login karke Done dabao"
-                Toast.makeText(this@LoginActivity, "Cookies nahi mile — login poora karo", Toast.LENGTH_LONG).show()
+                val why = when (result) {
+                    is SessionManager.UploadResult.NoCookies ->
+                        "Cookies nahi mile — login poora karo, phir Done dabao"
+                    is SessionManager.UploadResult.ServerError ->
+                        "Server ne save nahi kiya (HTTP ${result.code}) — dobara try karo"
+                    else -> "Net/server issue — dobara try karo"
+                }
+                statusText.text = "Session save nahi hua — $why"
+                Toast.makeText(this@LoginActivity, why, Toast.LENGTH_LONG).show()
             }
         }
     }

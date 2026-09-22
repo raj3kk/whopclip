@@ -191,6 +191,18 @@
                     android:text="—"
                     android:textSize="14sp" />
 
+                <TextView
+                    android:id="@+id/loginDetailsText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:padding="12dp"
+                    android:background="#1AFFFFFF"
+                    android:text="🔐 Login details: load ho raha…"
+                    android:textSize="14sp"
+                    android:clickable="true"
+                    android:focusable="true" />
+
                 <LinearLayout
                     android:id="@+id/connectBox"
                     android:layout_width="match_parent"

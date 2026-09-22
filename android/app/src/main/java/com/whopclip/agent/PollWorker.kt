@@ -9,6 +9,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
+import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -30,6 +31,12 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
+            // Foreground worker: shows the persistent "background me chal raha
+            // hai" notification. This is the sanctioned way to run from the
+            // background on Android 12+ (plain startForegroundService is
+            // blocked after boot) — and it re-arms automation after reboot
+            // even when the PollService process was killed.
+            setForeground(createForegroundInfo())
             // Pairing gate: unpaired phone must not touch the server queue.
             if (!SessionManager.isPaired(applicationContext)) {
                 Log.i(TAG, "unpaired device — polling skipped")
@@ -64,6 +71,35 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
             Log.e(TAG, "poll error", e)
             Result.retry()
         }
+    }
+
+    /** Foreground notification shown while the worker runs in background. */
+    private fun createForegroundInfo(): ForegroundInfo {
+        val ctx = applicationContext
+        val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            mgr.createNotificationChannel(
+                NotificationChannel(
+                    PollService.CHANNEL_ID, "WhopClip background",
+                    NotificationManager.IMPORTANCE_LOW
+                )
+            )
+        }
+        val openIntent = Intent(ctx, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pi = PendingIntent.getActivity(
+            ctx, 0, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notif = NotificationCompat.Builder(ctx, PollService.CHANNEL_ID)
+            .setContentTitle("WhopClip background me chal raha hai")
+            .setContentText("Automation jobs ka wait ho raha hai")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .build()
+        return ForegroundInfo(PollService.NOTIF_ID, notif)
     }
 
     /** Server storage is ephemeral: if it forgot our session, re-upload. */

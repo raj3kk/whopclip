@@ -126,12 +126,21 @@ object SessionManager {
                     Log.i(TAG, "device paired with code $clean")
                 } else {
                     Log.w(TAG, "pair failed: HTTP $httpCode body=$errBody")
-                    lastPairError = if (httpCode == 404) {
-                        val expired = errBody.contains("expir", ignoreCase = true)
-                        if (expired) "Code expire ho gaya — website se naya code banao"
-                        else "Galat code — website /connect wala code exactly dalo"
-                    } else {
-                        "Server error ($httpCode) — net check karke dobara try karo"
+                    lastPairError = when {
+                        httpCode == 404 -> {
+                            val expired = errBody.contains("expir", ignoreCase = true)
+                            if (expired) "Code expire ho gaya — website se naya code banao"
+                            else "Galat code — website /connect wala code exactly dalo"
+                        }
+                        httpCode in 500..599 -> {
+                            // Server-side problem (not the phone's network).
+                            // The kv-upsert 409 class of bugs lives here.
+                            "Server me dikkat hai ($httpCode) — net ka issue nahi, thodi der me dobara try karo"
+                        }
+                        else -> {
+                            val detail = errBody.ifBlank { "code $httpCode" }
+                            "Pair nahi hua ($detail) — code dobara check karo"
+                        }
                     }
                 }
                 ok
@@ -146,55 +155,124 @@ object SessionManager {
     @Volatile
     var lastPairError: String = ""
 
+    /** Truthful result of a session upload — the UI shows exactly what happened. */
+    sealed class UploadResult {
+        data object Success : UploadResult()
+        /** No cookies found for the domain (user not logged in here, or WebView hasn't synced yet). */
+        data object NoCookies : UploadResult()
+        /** Server rejected the upload (HTTP code). */
+        data class ServerError(val code: Int) : UploadResult()
+        /** Phone couldn't reach the server at all. */
+        data object NetworkError : UploadResult()
+    }
+
+    /**
+     * Definitive login check from the cookie jar (not URL heuristics):
+     * Instagram sets `sessionid` only when actually logged in.
+     * For Whop we check known auth cookie names, falling back to a
+     * heuristic (several cookies present + not on a login page).
+     */
+    fun isLoggedInByCookies(service: String, cookies: Map<String, String>, url: String): Boolean {
+        if (service == "instagram") return cookies.containsKey("sessionid")
+        if (service == "whop") {
+            val names = cookies.keys.map { it.lowercase() }.toSet()
+            val known = listOf(
+                "__secure-next-auth.session-token", "next-auth.session-token",
+                "__secure-authjs.session-token", "authjs.session-token",
+                "whop_session", "whop-session", "session", "__session"
+            )
+            if (known.any { it in names }) return true
+            val onAuthPage = url.contains("/login") || url.contains("/signup") ||
+                    url.contains("/sign-in") || url.contains("/auth")
+            // Best effort: a logged-in Whop page carries several cookies.
+            return !onAuthPage && cookies.size >= 3
+        }
+        return false
+    }
+
+    /** Read cookies for [url], flushing the store first and retrying once. */
+    fun readCookies(url: String): Map<String, String> {
+        val cm = CookieManager.getInstance()
+        // Force any pending Set-Cookie writes into the store before reading.
+        try { cm.flush() } catch (_: Exception) { }
+        fun parse(raw: String?): Map<String, String> {
+            if (raw.isNullOrBlank()) return emptyMap()
+            return raw.split(";").mapNotNull {
+                val kv = it.trim().split("=", limit = 2)
+                if (kv.size == 2 && kv[0].isNotEmpty()) kv[0] to kv[1] else null
+            }.toMap()
+        }
+        var cookies = parse(try { cm.getCookie(url) } catch (_: Exception) { null })
+        if (cookies.isEmpty()) {
+            // Cookies can land just after page load (XHR-set). One short retry.
+            try { Thread.sleep(1500) } catch (_: InterruptedException) { }
+            try { cm.flush() } catch (_: Exception) { }
+            cookies = parse(try { cm.getCookie(url) } catch (_: Exception) { null })
+            // Last resort: try the bare host root (some cookies are path-scoped oddly).
+            if (cookies.isEmpty()) {
+                try {
+                    val host = URL(url).host
+                    if (host.isNotEmpty()) cookies = parse(cm.getCookie("https://$host/"))
+                } catch (_: Exception) { }
+            }
+        }
+        Log.i(TAG, "readCookies: ${cookies.size} cookies for ${try { URL(url).host } catch (_: Exception) { url }}")
+        return cookies
+    }
+
     /**
      * Pull cookies for [url] out of the WebView cookie store and POST them
      * to the server as this device's session for [service] ("whop"|"instagram").
-     * Returns true when the server acknowledged the session.
+     * Returns a truthful [UploadResult] so the UI can say exactly what happened
+     * instead of guessing "login nahi hua".
+     *
+     * @param account best-effort username/handle (extracted from the page via JS
+     * by the caller); "" when unknown.
      */
-    suspend fun uploadSession(ctx: Context, service: String, url: String): Boolean =
-        withContext(Dispatchers.IO) {
-            try {
-                val raw = CookieManager.getInstance().getCookie(url) ?: ""
-                if (raw.isBlank()) {
-                    Log.w(TAG, "no cookies for $service at $url")
-                    return@withContext false
-                }
-                val cookies = raw.split(";").mapNotNull {
-                    val kv = it.trim().split("=", limit = 2)
-                    if (kv.size == 2) kv[0] to kv[1] else null
-                }.toMap()
-
-                val body = JSONObject().apply {
-                    put("device_id", deviceId(ctx))
-                    put("service", service)
-                    put("cookies", JSONObject(cookies as Map<*, *>))
-                    put("user_agent", System.getProperty("http.agent") ?: "WhopClip/1.0")
-                    put("device_model", "${Build.MANUFACTURER} ${Build.MODEL}")
-                }
-
-                val conn = (URL("${serverUrl(ctx)}/api/sessions").openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    setRequestProperty("Content-Type", "application/json")
-                    connectTimeout = 20000
-                    readTimeout = 20000
-                    doOutput = true
-                }
-                OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
-                val code = conn.responseCode
-                conn.disconnect()
-                if (code in 200..299) {
-                    prefs(ctx).edit()
-                        .putBoolean(if (service == "whop") KEY_WHOP_DONE else KEY_IG_DONE, true)
-                        .apply()
-                    Log.i(TAG, "$service session uploaded")
-                    true
-                } else {
-                    Log.w(TAG, "session upload failed: HTTP $code")
-                    false
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "uploadSession failed", e)
-                false
-            }
+    suspend fun uploadSession(
+        ctx: Context,
+        service: String,
+        url: String,
+        account: String = ""
+    ): UploadResult = withContext(Dispatchers.IO) {
+        val cookies = readCookies(url)
+        if (cookies.isEmpty()) {
+            Log.w(TAG, "no cookies for $service at $url")
+            return@withContext UploadResult.NoCookies
         }
+        try {
+            val body = JSONObject().apply {
+                put("device_id", deviceId(ctx))
+                put("service", service)
+                put("cookies", JSONObject(cookies as Map<*, *>))
+                put("account", account)
+                put("user_agent", System.getProperty("http.agent") ?: "WhopClip/1.0")
+                put("device_model", "${Build.MANUFACTURER} ${Build.MODEL}")
+            }
+
+            val conn = (URL("${serverUrl(ctx)}/api/sessions").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                setRequestProperty("Content-Type", "application/json")
+                connectTimeout = 20000
+                readTimeout = 20000
+                doOutput = true
+            }
+            OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
+            val code = conn.responseCode
+            conn.disconnect()
+            if (code in 200..299) {
+                prefs(ctx).edit()
+                    .putBoolean(if (service == "whop") KEY_WHOP_DONE else KEY_IG_DONE, true)
+                    .apply()
+                Log.i(TAG, "$service session uploaded (${cookies.size} cookies, account='$account')")
+                UploadResult.Success
+            } else {
+                Log.w(TAG, "session upload failed: HTTP $code")
+                UploadResult.ServerError(code)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "uploadSession failed", e)
+            UploadResult.NetworkError
+        }
+    }
 }

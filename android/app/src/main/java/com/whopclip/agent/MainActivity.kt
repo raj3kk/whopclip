@@ -77,11 +77,15 @@ class MainActivity : Activity() {
     // Profile tab
     private lateinit var profileConnText: TextView
     private lateinit var profileServerText: TextView
+    private lateinit var loginDetailsText: TextView
     private lateinit var connectBox: LinearLayout
     private lateinit var onlineBox: LinearLayout
     private lateinit var pairInput: EditText
     private lateinit var versionText: TextView
     private lateinit var serverInput: EditText
+
+    /** Latest server-side session details, for the tap-to-view dialog. */
+    private var lastSessionDetails: String = ""
 
     private var connectDialogShown = false
 
@@ -202,28 +206,84 @@ class MainActivity : Activity() {
         return GOOGLE_SEARCH + q.replace(" ", "+")
     }
 
-    /** Auto-detect login: when the user lands logged-in, upload session once. */
+    /** Auto-detect login: when the user lands logged-in, upload session once.
+     * Uses the actual cookie jar (sessionid etc.), not URL guesses — and
+     * re-checks shortly after page load since cookies can land via XHR. */
     private fun autoDetectSession(url: String?) {
         if (url == null) return
         val host = try { URL(url).host } catch (_: Exception) { return }
         val service = when {
-            host.endsWith("whop.com") && !url.contains("/login") && !url.contains("/signup") -> "whop"
-            host.endsWith("instagram.com") && !url.contains("/accounts/login") -> "instagram"
+            host.endsWith("whop.com") -> "whop"
+            host.endsWith("instagram.com") -> "instagram"
             else -> return
         }
         val done = if (service == "whop") SessionManager.isWhopLinked(this)
                    else SessionManager.isIgLinked(this)
         if (done) return
         CoroutineScope(Dispatchers.Main).launch {
-            val ok = SessionManager.uploadSession(this@MainActivity, service, url)
-            if (ok) {
-                Toast.makeText(this@MainActivity,
-                    "$service login save ho gaya ✓ — server ab is session se kaam karega",
-                    Toast.LENGTH_LONG).show()
-                refreshProfile()
+            // Small delay: let XHR-set cookies land after page finished.
+            kotlinx.coroutines.delay(2500)
+            val cookies = SessionManager.readCookies(url)
+            if (!SessionManager.isLoggedInByCookies(service, cookies, url)) return@launch
+            val account = extractAccount(service)
+            when (SessionManager.uploadSession(this@MainActivity, service, url, account)) {
+                is SessionManager.UploadResult.Success -> {
+                    val who = if (account.isNotEmpty()) " (@$account)" else ""
+                    Toast.makeText(this@MainActivity,
+                        "$service login auto-save ho gaya$who ✓",
+                        Toast.LENGTH_LONG).show()
+                    refreshProfile()
+                }
+                else -> { /* silent — user can tap Session save manually */ }
             }
         }
     }
+
+    /**
+     * Best-effort username/handle extraction from the current Browser page.
+     * Runs on the UI thread (WebView.evaluateJavascript needs it).
+     */
+    private suspend fun extractAccount(service: String): String =
+        kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+            val js = when (service) {
+                "instagram" -> """
+                    (function(){
+                      try {
+                        var html = document.documentElement.innerHTML;
+                        var m = html.match(/"username"\s*:\s*"([A-Za-z0-9._]{2,30})"/);
+                        if (m) return m[1];
+                        var link = document.querySelector('a[href^="/"][href$="/"]');
+                        return "";
+                      } catch(e){ return ""; }
+                    })()
+                """.trimIndent()
+                else -> """
+                    (function(){
+                      try {
+                        var html = document.documentElement.innerHTML;
+                        var m = html.match(/"(?:username|handle)"\s*:\s*"([A-Za-z0-9._-]{2,40})"/);
+                        if (m) return m[1];
+                        return "";
+                      } catch(e){ return ""; }
+                    })()
+                """.trimIndent()
+            }
+            try {
+                browserWebView.evaluateJavascript(js) { raw ->
+                    val v = raw?.trim()?.trim('"') ?: ""
+                    if (cont.isActive) cont.resume(
+                        if (v.isNotEmpty() && v != "null") v else "",
+                        onCancellation = null
+                    )
+                }
+            } catch (_: Exception) {
+                if (cont.isActive) cont.resume("", onCancellation = null)
+            }
+            // Safety timeout — never hang the save flow on JS.
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (cont.isActive) cont.resume("", onCancellation = null)
+            }, 8000)
+        }
 
     private fun saveCurrentSession() {
         val url = browserWebView.url ?: run {
@@ -241,11 +301,23 @@ class MainActivity : Activity() {
         }
         CoroutineScope(Dispatchers.Main).launch {
             Toast.makeText(this@MainActivity, "Session save ho raha hai…", Toast.LENGTH_SHORT).show()
-            val ok = SessionManager.uploadSession(this@MainActivity, service, url)
-            Toast.makeText(this@MainActivity,
-                if (ok) "$service session server pe save ✓"
-                else "Cookies nahi mile — pehle login poora karo",
-                Toast.LENGTH_LONG).show()
+            val account = extractAccount(service)
+            val msg = when (val r = SessionManager.uploadSession(this@MainActivity, service, url, account)) {
+                is SessionManager.UploadResult.Success -> {
+                    val who = if (account.isNotEmpty()) " (@$account)" else ""
+                    "$service session server pe save ✓$who"
+                }
+                is SessionManager.UploadResult.NoCookies -> {
+                    val loggedIn = SessionManager.isLoggedInByCookies(service, SessionManager.readCookies(url), url)
+                    if (loggedIn) "Cookies mil gaye lekin session adhura hai — page refresh karke dobara try karo"
+                    else "Is page pe login nahi dikha — pehle $service me login poora karo, phir save dabao"
+                }
+                is SessionManager.UploadResult.ServerError ->
+                    "Server ne save nahi kiya (HTTP ${r.code}) — thodi der me dobara try karo"
+                is SessionManager.UploadResult.NetworkError ->
+                    "Server tak pahunch nahi paya — net check karke dobara try karo"
+            }
+            Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
             refreshProfile()
         }
     }
@@ -310,12 +382,23 @@ class MainActivity : Activity() {
     private fun setupProfileTab() {
         profileConnText = findViewById(R.id.profileConnText)
         profileServerText = findViewById(R.id.profileServerText)
+        loginDetailsText = findViewById(R.id.loginDetailsText)
         connectBox = findViewById(R.id.connectBox)
         onlineBox = findViewById(R.id.onlineBox)
         pairInput = findViewById(R.id.pairInput)
         versionText = findViewById(R.id.versionText)
         serverInput = findViewById(R.id.serverInput)
         serverInput.setText(SessionManager.serverUrl(this))
+
+        // Tappable login-details section: shows full server-side session info.
+        loginDetailsText.setOnClickListener {
+            val details = lastSessionDetails.ifBlank { "Abhi tak koi login detail server se nahi aaya." }
+            AlertDialog.Builder(this)
+                .setTitle("🔐 Login details")
+                .setMessage(details)
+                .setPositiveButton("OK", null)
+                .show()
+        }
 
         findViewById<Button>(R.id.saveServerBtn).setOnClickListener {
             val u = serverInput.text.toString().trim()
@@ -393,6 +476,67 @@ class MainActivity : Activity() {
             val info = fetchDeviceInfo()
             if (info != null) profileServerText.text = info
         }
+        // Server-side login/session details (tappable section).
+        CoroutineScope(Dispatchers.Main).launch {
+            refreshLoginDetails()
+        }
+    }
+
+    /** Fetches /api/sessions/status and renders the tappable Login details section. */
+    private suspend fun refreshLoginDetails() {
+        val summary = fetchSessionStatus()
+        if (summary != null) {
+            loginDetailsText.text = summary.first
+            lastSessionDetails = summary.second
+        } else {
+            loginDetailsText.text = "🔐 Login details: server se load nahi hua (tap)"
+            lastSessionDetails = "Server se session details nahi mil paye — net check karo."
+        }
+    }
+
+    /**
+     * GET /api/sessions/status?device_id=...
+     * Returns Pair(summary line, full details for the dialog), or null on failure.
+     */
+    private suspend fun fetchSessionStatus(): Pair<String, String>? = withContext(Dispatchers.IO) {
+        try {
+            val deviceId = SessionManager.deviceId(this@MainActivity)
+            val url = "${SessionManager.serverUrl(this@MainActivity)}/api/sessions/status?device_id=$deviceId"
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 15000
+                readTimeout = 15000
+            }
+            val code = conn.responseCode
+            val body = try { conn.inputStream.bufferedReader().readText() } catch (_: Exception) { "" }
+            conn.disconnect()
+            if (code !in 200..299) return@withContext null
+            val services = JSONObject(body).optJSONObject("services") ?: return@withContext null
+            val full = StringBuilder()
+            val summ = StringBuilder("🔐 Login details (tap karo):\n")
+            for (svc in listOf("whop", "instagram")) {
+                val s = services.optJSONObject(svc) ?: continue
+                val linked = s.optBoolean("linked", false)
+                val stale = s.optBoolean("stale", false)
+                val account = s.optString("account", "")
+                val updated = s.optString("updated_at", "")
+                val label = svc.replaceFirstChar { it.uppercase() }
+                val state = when {
+                    !linked -> "✗ not linked"
+                    stale -> "⚠ linked lekin stale (dobara login karo)"
+                    else -> "✓ linked"
+                }
+                summ.append("$label: $state")
+                if (account.isNotEmpty()) summ.append(" (@$account)")
+                summ.append("\n")
+                full.append("$label\n")
+                full.append("Status: $state\n")
+                if (account.isNotEmpty()) full.append("Account: @$account\n")
+                if (updated.isNotEmpty()) full.append("Saved: ${updated.take(16).replace("T", " ")}\n")
+                full.append("Server in cookies ko automation ke liye use kar sakta hai.\n\n")
+            }
+            Pair(summ.toString().trimEnd(), full.toString().trimEnd())
+        } catch (_: Exception) { null }
     }
 
     private suspend fun fetchDeviceInfo(): String? = withContext(Dispatchers.IO) {
