@@ -62,21 +62,40 @@ export const supabaseKV: KVBackend = {
 
   async set(key: string, value: unknown) {
     const full = `whopclip:${key}`;
-    const payload = {
+    const now = new Date().toISOString();
+    const filter = `device_id=eq.${DEVICE}&key=eq.${encodeURIComponent(full)}`;
+    // NOTE (2026-09-22): PostgREST upsert (?on_conflict=device_id,key) 409s
+    // on this project's flipify_kv because there is no UNIQUE(device_id,key)
+    // constraint. So: PATCH-then-POST. PATCH updates the existing row when
+    // the key exists; POST inserts when it does not. If a concurrent writer
+    // wins the race between our PATCH and POST, retry the PATCH once.
+    const upd = await sb(
+      "PATCH",
+      `/rest/v1/flipify_kv?${filter}`,
+      { value: value as Record<string, unknown>, updated_at: now }
+    );
+    if (upd.status === 200 && Array.isArray(upd.json) && upd.json.length > 0) return;
+    if (upd.status !== 200) {
+      throw new Error(`kvSet patch failed: ${upd.status}`);
+    }
+    const ins = await sb("POST", `/rest/v1/flipify_kv`, {
       device_id: DEVICE,
       key: full,
       value: value as Record<string, unknown>,
-      updated_at: new Date().toISOString(),
-    };
-    // upsert on (device_id,key)
-    const { status } = await sb(
-      "POST",
-      `/rest/v1/flipify_kv?on_conflict=device_id,key`,
-      payload
-    );
-    if (status !== 200 && status !== 201) {
-      throw new Error(`kvSet failed: ${status}`);
+      updated_at: now,
+    });
+    if (ins.status === 200 || ins.status === 201) return;
+    if (ins.status === 409) {
+      // lost a write race — the row exists now, patch it
+      const retry = await sb(
+        "PATCH",
+        `/rest/v1/flipify_kv?${filter}`,
+        { value: value as Record<string, unknown>, updated_at: now }
+      );
+      if (retry.status === 200) return;
+      throw new Error(`kvSet race-retry failed: ${retry.status}`);
     }
+    throw new Error(`kvSet failed: ${ins.status}`);
   },
 
   async cas(key: string, value: unknown, updatedAt: string) {
