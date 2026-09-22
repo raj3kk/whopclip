@@ -33,6 +33,7 @@ class JobRunnerActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var progress: ProgressBar
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private val engine: JobEngine by lazy { JobEngine(this) }
 
     private val filePicker =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -70,6 +71,12 @@ class JobRunnerActivity : AppCompatActivity() {
                 callback: ValueCallback<Array<Uri>>?,
                 params: FileChooserParams?
             ): Boolean {
+                if (callback != null && engine.handleFileChooser(callback)) {
+                    // Engine auto-supplied the pre-downloaded video — signal the
+                    // waiting "upload" step directly, no picker needed.
+                    UploadBridge.signal(true)
+                    return true
+                }
                 filePathCallback?.onReceiveValue(null)
                 filePathCallback = callback
                 UploadBridge.arm()
@@ -103,7 +110,7 @@ class JobRunnerActivity : AppCompatActivity() {
 
                 runOnUiThread { statusText.text = "Job chal raha hai: ${job.optString("type")}" }
                 try {
-                    val out = JobEngine(this@JobRunnerActivity).run(job, webView)
+                    val out = engine.run(job, webView)
                     reportJob(job.getString("id"), "done", out)
                     runOnUiThread {
                         statusText.text = "Job ho gaya ✓"

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Attrs referenced by library styles but declared in res-less AARs -->
+    <attr name="drawerLayoutStyle" format="reference" />
+</resources>

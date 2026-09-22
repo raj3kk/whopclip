@@ -35,6 +35,9 @@ class LoginActivity : AppCompatActivity() {
         // Heuristic: these hosts mean "logged in" for each service.
         const val WHOP_OK_HOST = "whop.com"
         const val IG_OK_PATH_HINT = "instagram.com"
+
+        fun intentFor(ctx: Context, service: String): Intent =
+            Intent(ctx, LoginActivity::class.java).putExtra(EXTRA_SERVICE, service)
     }
 
     private lateinit var webView: WebView
@@ -128,10 +131,5 @@ class LoginActivity : AppCompatActivity() {
 
     override fun onBackPressed() {
         if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
-    }
-
-    companion object {
-        fun intentFor(ctx: Context, service: String): Intent =
-            Intent(ctx, LoginActivity::class.java).putExtra(EXTRA_SERVICE, service)
     }
 }

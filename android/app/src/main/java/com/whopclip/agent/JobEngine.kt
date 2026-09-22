@@ -1,20 +1,29 @@
 package com.whopclip.agent
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.webkit.JavascriptInterface
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlin.coroutines.resume
 
 /**
@@ -46,6 +55,57 @@ class JobEngine(private val ctx: Context) {
 
     @Volatile private var lastJsResult: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Video URI pre-downloaded from the job's video_url (auto-supplied to file inputs). */
+    private var pendingVideoUri: Uri? = null
+
+    /**
+     * Called by JobRunnerActivity.onShowFileChooser. Returns true if the engine
+     * auto-supplied the pre-downloaded video (no picker needed).
+     */
+    fun handleFileChooser(callback: ValueCallback<Array<Uri>>): Boolean {
+        val uri = pendingVideoUri
+        if (uri != null) {
+            pendingVideoUri = null // one-shot
+            mainHandler.post { callback.onReceiveValue(arrayOf(uri)) }
+            Log.i(TAG, "file chooser auto-supplied: $uri")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Downloads job.payload.video_url (set by the orchestrator) into the app
+     * cache and returns a FileProvider content URI, or null when absent/failed.
+     */
+    private suspend fun prepareUploadVideo(job: JSONObject): Uri? =
+        withContext(Dispatchers.IO) {
+            val url = job.optJSONObject("payload")?.optString("video_url").orEmpty()
+            if (url.isBlank()) return@withContext null
+            try {
+                val dir = File(ctx.cacheDir, "uploads").apply { mkdirs() }
+                val out = File(dir, "job_${job.optString("id", "vid")}.mp4")
+                if (!out.exists() || out.length() == 0L) {
+                    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                        instanceFollowRedirects = true
+                        connectTimeout = 30000
+                        readTimeout = 120000
+                        setRequestProperty("User-Agent", "WhopClip/1.0")
+                    }
+                    if (conn.responseCode !in 200..299)
+                        throw Exception("video download HTTP ${conn.responseCode}")
+                    conn.inputStream.use { inp ->
+                        FileOutputStream(out).use { o -> inp.copyTo(o) }
+                    }
+                    conn.disconnect()
+                }
+                if (out.length() == 0L) return@withContext null
+                FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", out)
+            } catch (e: Exception) {
+                Log.w(TAG, "prepareUploadVideo failed: ${e.message}")
+                null
+            }
+        }
 
     private inner class JsBridge {
         @JavascriptInterface
@@ -126,6 +186,9 @@ class JobEngine(private val ctx: Context) {
             }
 
             try {
+                // Pre-download the orchestrator-provided video so file inputs can
+                // be auto-filled without the system picker (see handleFileChooser).
+                pendingVideoUri = prepareUploadVideo(job)
                 for (i in 0 until steps.length()) {
                     val s = steps.getJSONObject(i)
                     when (s.optString("action")) {
