@@ -16,7 +16,7 @@ export async function POST(req: NextRequest) {
     }
     const encrypted = encryptSession(JSON.stringify(cookies));
     const now = new Date().toISOString();
-    saveSession({
+    await saveSession({
       device_id,
       service: service as ServiceName,
       encrypted,

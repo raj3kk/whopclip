@@ -11,5 +11,5 @@ export async function GET(req: NextRequest) {
   if (!device_id) {
     return NextResponse.json({ error: "device_id required" }, { status: 400 });
   }
-  return NextResponse.json({ device_id, services: sessionStatus(device_id) });
+  return NextResponse.json({ device_id, services: await sessionStatus(device_id) });
 }

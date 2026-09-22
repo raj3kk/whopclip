@@ -4,14 +4,14 @@ import { claimJob } from "@/lib/store";
 /**
  * GET /api/jobs/next?device_id=...
  * Phone long-polls this. Returns { job } or 204 when the queue is empty.
- * Claiming is atomic within this process (single-flight in-memory).
+ * Claiming is atomic (CAS on updated_at) so two pollers never run the same job.
  */
 export async function GET(req: NextRequest) {
   const device_id = req.nextUrl.searchParams.get("device_id");
   if (!device_id) {
     return NextResponse.json({ error: "device_id required" }, { status: 400 });
   }
-  const job = claimJob(device_id);
+  const job = await claimJob(device_id);
   if (!job) return new NextResponse(null, { status: 204 });
   return NextResponse.json({ job });
 }

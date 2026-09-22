@@ -19,10 +19,10 @@ export async function GET(req: NextRequest) {
   if (!device_id) {
     return NextResponse.json({ error: "device_id required" }, { status: 400 });
   }
-  if (!getSession(device_id, "whop")) {
+  if (!(await getSession(device_id, "whop"))) {
     return NextResponse.json({ error: "whop not linked" }, { status: 409 });
   }
-  return NextResponse.json({ device_id, campaigns: listCampaigns() });
+  return NextResponse.json({ device_id, campaigns: await listCampaigns() });
 }
 
 export async function POST(req: NextRequest) {
@@ -33,7 +33,7 @@ export async function POST(req: NextRequest) {
       if (!device_id) {
         return NextResponse.json({ error: "device_id required" }, { status: 400 });
       }
-      const campaign = selectCampaign(device_id);
+      const campaign = await selectCampaign(device_id);
       if (!campaign) {
         return NextResponse.json(
           { campaign: null, reason: "no eligible campaign (inactive / no budget / already submitted)" }
@@ -50,8 +50,8 @@ export async function POST(req: NextRequest) {
         );
       }
       const now = new Date().toISOString();
-      const existing = listCampaigns().find((x) => x.id === c.id);
-      upsertCampaign({
+      const existing = (await listCampaigns()).find((x) => x.id === c.id);
+      await upsertCampaign({
         id: c.id,
         name: c.name,
         whop_url: c.whop_url,

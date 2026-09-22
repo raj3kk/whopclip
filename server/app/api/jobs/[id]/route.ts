@@ -44,9 +44,8 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
         created_at: now,
         updated_at: now,
       };
-      enqueueJob(job);
-      return NextResponse.json({ ok: true, job });
-    } catch (e: unknown) {
+      await enqueueJob(job);
+      return NextResponse.json({ ok: true, job });    } catch (e: unknown) {
       return NextResponse.json({ error: e instanceof Error ? e.message : "unknown" }, { status: 500 });
     }
   }
@@ -56,7 +55,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     const { status, result } = body ?? {};
 
     if (status === "requeue") {
-      const job = requeueJob(params.id);
+      const job = await requeueJob(params.id);
       if (!job) return NextResponse.json({ error: "job not found" }, { status: 404 });
       return NextResponse.json({ ok: true, job });
     }
@@ -68,22 +67,22 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     // Checkpoint 10: session expired -> flag for re-login prompt.
     const r = (result ?? {}) as Record<string, unknown>;
     if (r.session_expired === true && (r.service === "whop" || r.service === "instagram")) {
-      const job0 = finishJob(params.id, status as JobStatus, result ?? null);
-      markSessionStale(job0?.device_id ?? "", r.service as ServiceName);
+      const job0 = await finishJob(params.id, status as JobStatus, result ?? null);
+      await markSessionStale(job0?.device_id ?? "", r.service as ServiceName);
       return NextResponse.json({ ok: true, job: job0, session_stale: r.service });
     }
 
-    const job = finishJob(params.id, status as JobStatus, result ?? null);
+    const job = await finishJob(params.id, status as JobStatus, result ?? null);
     if (!job) return NextResponse.json({ error: "job not found" }, { status: 404 });
 
     // Checkpoints 1+9: successful Whop submit -> earnings ledger (dup-proof).
     if (job.type === "whop_submit" && status === "done") {
       const campaign_id = typeof r.campaign_id === "string" ? r.campaign_id : "";
       const ig_post_url = typeof r.ig_post_url === "string" ? r.ig_post_url : "";
-      if (campaign_id && ig_post_url && !alreadySubmitted(job.device_id, campaign_id)) {
-        const camp = getCampaign(campaign_id);
+      if (campaign_id && ig_post_url && !(await alreadySubmitted(job.device_id, campaign_id))) {
+        const camp = await getCampaign(campaign_id);
         const now = new Date().toISOString();
-        recordSubmission({
+        await recordSubmission({
           id: crypto.randomUUID(),
           device_id: job.device_id,
           campaign_id,

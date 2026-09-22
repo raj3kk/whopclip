@@ -1,43 +1,42 @@
 /**
- * Minimal in-memory store for v1 skeleton.
- * PRODUCTION NOTE: replace with a real DB (Vercel KV / Postgres) —
- * serverless instances do not share memory, so jobs/sessions would be
- * lost between invocations on Vercel. This is scaffolding only.
+ * WhopClip control-plane state.
+ *
+ * Storage: Supabase `flipify_kv` (namespaced `whopclip:*`) when
+ * SUPABASE_SERVICE_ROLE_KEY is set; otherwise a process-local in-memory
+ * store (dev / pre-provisioned mode — state does not survive cold starts).
+ *
+ * All functions are async. Key layout:
+ *   session:{device_id}:{service}   Session
+ *   campaign:{id}                   Campaign
+ *   campaigns                       string[] (index of campaign ids)
+ *   job:{id}                        Job
+ *   queue:{device_id}               string[] (job ids, enqueue order)
+ *   submission:{id}                 Submission
+ *   submissions:{device_id}         string[] (submission ids)
  */
 
-export type ServiceName = "whop" | "instagram";
+import { dbEnabled, supabaseKV, type KVBackend } from "./db";
 
-export interface DeviceSession {
+export type ServiceName = "whop" | "instagram";
+export type JobStatus = "queued" | "running" | "done" | "failed";
+export type SubmissionStatus = "submitted" | "pending" | "approved" | "rejected";
+
+export interface Session {
   device_id: string;
   service: ServiceName;
-  /** AES-256-GCM encrypted JSON of cookies */
-  encrypted: string;
+  encrypted: string; // AES-256-GCM blob (JSON string)
   user_agent: string;
   device_model: string;
-  /** true when the phone reported this session expired -> user must re-login */
   stale: boolean;
   created_at: string;
   updated_at: string;
 }
 
-export type JobStatus = "queued" | "running" | "done" | "failed";
-
-export interface Job {
-  id: string;
-  device_id: string;
-  type: "ig_post" | "whop_submit" | "whop_check_join" | "whop_join" | "custom";
-  status: JobStatus;
-  steps: unknown[];
-  result: unknown | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface CampaignRequirements {
-  video_max_duration_s: number;
+export interface Requirements {
+  video_max_duration_s: number | null;
   aspect: "9:16";
   captions_required: boolean;
-  caption_template: string;
+  caption_template: string | null;
   required_mentions: string[];
   required_hashtags: string[];
   posting_rules: string[];
@@ -52,12 +51,23 @@ export interface Campaign {
   budget_remaining: number;
   payout_per_1k: number;
   joined: boolean;
-  requirements: CampaignRequirements | null;
+  requirements: Requirements | null;
   created_at: string;
   updated_at: string;
 }
 
-export type SubmissionStatus = "submitted" | "pending" | "approved" | "rejected";
+export interface JobStep { [k: string]: unknown }
+
+export interface Job {
+  id: string;
+  device_id: string;
+  type: string;
+  status: JobStatus;
+  steps: JobStep[];
+  result: unknown;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface Submission {
   id: string;
@@ -72,180 +82,281 @@ export interface Submission {
   created_at: string;
 }
 
-declare global {
-  // eslint-disable-next-line no-var
-  var __whopclip_store:
-    | {
-        sessions: Map<string, DeviceSession>;
-        jobs: Map<string, Job>;
-        campaigns: Map<string, Campaign>;
-        submissions: Map<string, Submission>;
-      }
-    | undefined;
+/* ---------------- backend ---------------- */
+
+class MemoryKV implements KVBackend {
+  private m = new Map<string, { value: unknown; updated_at: string }>();
+  async get(key: string) {
+    return this.m.get(key)?.value ?? null;
+  }
+  async set(key: string, value: unknown) {
+    this.m.set(key, { value, updated_at: new Date().toISOString() });
+  }
+  async cas(key: string, value: unknown, updatedAt: string) {
+    const cur = this.m.get(key);
+    if (!cur || cur.updated_at !== updatedAt) return false;
+    this.m.set(key, { value, updated_at: new Date().toISOString() });
+    return true;
+  }
+  /** used only for atomic claim: fetch raw row with updated_at */
+  async getRow(key: string) {
+    return this.m.get(key) ?? null;
+  }
 }
 
-function store() {
-  if (!global.__whopclip_store) {
-    global.__whopclip_store = {
-      sessions: new Map(),
-      jobs: new Map(),
-      campaigns: new Map(),
-      submissions: new Map(),
-    };
+const mem = new MemoryKV();
+const kv: KVBackend = dbEnabled ? supabaseKV : mem;
+if (!dbEnabled) {
+  console.warn("[whopclip] SUPABASE_SERVICE_ROLE_KEY not set — using ephemeral in-memory store");
+}
+
+/** Fetch a value plus its updated_at (for CAS). */
+async function getWithTs(key: string): Promise<{ value: unknown; updated_at: string } | null> {
+  if (!dbEnabled) return mem.getRow(key);
+  const full = `whopclip:${key}`;
+  const base = process.env.SUPABASE_URL ?? "https://lqvijxfbneqdrjzeeinn.supabase.co";
+  const k = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+  const res = await fetch(
+    `${base}/rest/v1/flipify_kv?device_id=eq.whopclip&key=eq.${encodeURIComponent(full)}&select=value,updated_at`,
+    { headers: { apikey: k, Authorization: `Bearer ${k}` } }
+  );
+  if (!res.ok) return null;
+  const arr = (await res.json()) as Array<{ value: unknown; updated_at: string }>;
+  if (!arr.length) return null;
+  return { value: arr[0].value, updated_at: arr[0].updated_at };
+}
+
+async function getIdx(key: string): Promise<string[]> {
+  const v = await kv.get(key);
+  return Array.isArray(v) ? (v as string[]) : [];
+}
+async function addToIdx(key: string, id: string) {
+  const idx = await getIdx(key);
+  if (!idx.includes(id)) {
+    idx.push(id);
+    await kv.set(key, idx);
   }
-  return global.__whopclip_store;
 }
 
 /* ---------------- sessions ---------------- */
 
-export function saveSession(s: DeviceSession) {
-  store().sessions.set(`${s.device_id}:${s.service}`, s);
+const sessionKey = (device_id: string, service: ServiceName) =>
+  `session:${device_id}:${service}`;
+
+export async function saveSession(s: Session): Promise<void> {
+  await kv.set(sessionKey(s.device_id, s.service), s);
 }
 
-export function getSession(device_id: string, service: ServiceName) {
-  return store().sessions.get(`${device_id}:${service}`) ?? null;
+export async function getSession(
+  device_id: string,
+  service: ServiceName
+): Promise<Session | null> {
+  const v = await kv.get(sessionKey(device_id, service));
+  return (v as Session) ?? null;
 }
 
-export function markSessionStale(device_id: string, service: ServiceName) {
-  const s = getSession(device_id, service);
-  if (s) {
-    s.stale = true;
-    s.updated_at = new Date().toISOString();
-  }
-  return s;
+export async function markSessionStale(device_id: string, service: ServiceName): Promise<void> {
+  const s = await getSession(device_id, service);
+  if (!s) return;
+  s.stale = true;
+  s.updated_at = new Date().toISOString();
+  await kv.set(sessionKey(device_id, service), s);
 }
 
-export function sessionStatus(device_id: string) {
-  const out: Record<ServiceName, { linked: boolean; stale: boolean }> = {
-    whop: { linked: false, stale: false },
-    instagram: { linked: false, stale: false },
-  };
+export async function sessionStatus(device_id: string): Promise<
+  Record<ServiceName, { linked: boolean; stale: boolean }>
+> {
+  const out = {} as Record<ServiceName, { linked: boolean; stale: boolean }>;
   for (const svc of ["whop", "instagram"] as ServiceName[]) {
-    const s = getSession(device_id, svc);
-    if (s) {
-      out[svc] = { linked: true, stale: s.stale };
-    }
+    const s = await getSession(device_id, svc);
+    out[svc] = { linked: !!s, stale: s?.stale === true };
   }
   return out;
 }
 
-/* ---------------- jobs ---------------- */
-
-export function enqueueJob(job: Job) {
-  store().jobs.set(job.id, job);
-}
-
-export function claimJob(device_id: string): Job | null {
-  for (const job of store().jobs.values()) {
-    if (job.device_id === device_id && job.status === "queued") {
-      job.status = "running";
-      job.updated_at = new Date().toISOString();
-      return job;
-    }
-  }
-  return null;
-}
-
-export function finishJob(id: string, status: JobStatus, result: unknown) {
-  const job = store().jobs.get(id);
-  if (!job) return null;
-  job.status = status;
-  job.result = result;
-  job.updated_at = new Date().toISOString();
-  return job;
-}
-
-/** Put a running job back to queued (e.g. needs foreground upload). */
-export function requeueJob(id: string) {
-  const job = store().jobs.get(id);
-  if (!job) return null;
-  job.status = "queued";
-  job.updated_at = new Date().toISOString();
-  return job;
-}
-
-export function listJobs(device_id: string): Job[] {
-  return [...store().jobs.values()].filter((j) => j.device_id === device_id);
-}
-
 /* ---------------- campaigns ---------------- */
 
-export function upsertCampaign(c: Campaign) {
-  store().campaigns.set(c.id, c);
-}
-
-export function getCampaign(id: string) {
-  return store().campaigns.get(id) ?? null;
-}
-
-export function listCampaigns(): Campaign[] {
-  return [...store().campaigns.values()];
-}
-
-/**
- * Checkpoint 1 — campaign select.
- * Eligible = active + budget remaining + NOT already submitted by this device.
- * Prefers already-joined, then highest payout per 1k views.
- */
-export function selectCampaign(device_id: string): Campaign | null {
-  const eligible = listCampaigns().filter(
-    (c) => c.active && c.budget_remaining > 0 && !alreadySubmitted(device_id, c.id)
-  );
-  if (eligible.length === 0) return null;
-  eligible.sort((a, b) => {
-    if (a.joined !== b.joined) return a.joined ? -1 : 1;
-    return b.payout_per_1k - a.payout_per_1k;
-  });
-  return eligible[0];
-}
-
-/**
- * Checkpoint 3 — requirements parsing. Defensive: fills defaults so a
- * malformed page can never produce a wrong-spec edit/post.
- */
-export function parseRequirements(raw: unknown): CampaignRequirements {
+export function parseRequirements(raw: unknown): Requirements {
   const r = (raw ?? {}) as Record<string, unknown>;
-  const str = (v: unknown, d: string) => (typeof v === "string" ? v : d);
-  const num = (v: unknown, d: number) =>
-    typeof v === "number" && Number.isFinite(v) ? v : d;
-  const arr = (v: unknown): string[] =>
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const list = (v: unknown) =>
     Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+  // duration: "30s"/"60 seconds"/45 -> seconds (default: no cap)
+  let dur: number | null = null;
+  const d = r.video_max_duration_s ?? r.duration ?? r.max_duration;
+  if (typeof d === "number" && d > 0) dur = d;
+  else if (typeof d === "string") {
+    const m = d.match(/(\d+(?:\.\d+)?)/);
+    if (m) dur = parseFloat(m[1]);
+  }
+  const payout =
+    typeof r.payout_per_1k === "number"
+      ? r.payout_per_1k
+      : parseFloat(str(r.payout_per_1k)) || 0;
   return {
-    video_max_duration_s: num(r.video_max_duration_s, 60),
-    aspect: "9:16",
+    video_max_duration_s: dur,
+    aspect: "9:16", // always forced
     captions_required: r.captions_required !== false,
-    caption_template: str(r.caption_template, ""),
-    required_mentions: arr(r.required_mentions),
-    required_hashtags: arr(r.required_hashtags),
-    posting_rules: arr(r.posting_rules),
-    payout_per_1k: num(r.payout_per_1k, 0),
+    caption_template: str(r.caption_template) || null,
+    required_mentions: list(r.required_mentions ?? r.mentions),
+    required_hashtags: list(r.required_hashtags ?? r.hashtags),
+    posting_rules: list(r.posting_rules ?? r.rules),
+    payout_per_1k: payout,
   };
 }
 
-/* ---------------- submissions / earnings ---------------- */
-
-export function recordSubmission(s: Submission) {
-  store().submissions.set(s.id, s);
+export async function upsertCampaign(c: Campaign): Promise<void> {
+  await kv.set(`campaign:${c.id}`, c);
+  await addToIdx("campaigns", c.id);
 }
 
-/** Checkpoint 1 — duplicate-submit prevention. */
-export function alreadySubmitted(device_id: string, campaign_id: string): boolean {
-  for (const s of store().submissions.values()) {
-    if (s.device_id === device_id && s.campaign_id === campaign_id) return true;
+export async function getCampaign(id: string): Promise<Campaign | null> {
+  const v = await kv.get(`campaign:${id}`);
+  return (v as Campaign) ?? null;
+}
+
+export async function listCampaigns(): Promise<Campaign[]> {
+  const ids = await getIdx("campaigns");
+  const out: Campaign[] = [];
+  for (const id of ids) {
+    const c = await getCampaign(id);
+    if (c) out.push(c);
+  }
+  return out;
+}
+
+/** Checkpoint 1 — eligible = active + budget>0 + not already submitted by this device. */
+export async function alreadySubmitted(
+  device_id: string,
+  campaign_id: string
+): Promise<boolean> {
+  const ids = await getIdx(`submissions:${device_id}`);
+  for (const id of ids) {
+    const s = (await kv.get(`submission:${id}`)) as Submission | null;
+    if (s && s.campaign_id === campaign_id) return true;
   }
   return false;
 }
 
-export function listSubmissions(device_id: string): Submission[] {
-  return [...store().submissions.values()].filter((s) => s.device_id === device_id);
+export async function selectCampaign(device_id: string): Promise<Campaign | null> {
+  const campaigns = await listCampaigns();
+  const eligible: Campaign[] = [];
+  for (const c of campaigns) {
+    if (!c.active || c.budget_remaining <= 0) continue;
+    if (await alreadySubmitted(device_id, c.id)) continue;
+    eligible.push(c);
+  }
+  eligible.sort((a, b) => {
+    if (a.joined !== b.joined) return a.joined ? -1 : 1;
+    return b.payout_per_1k - a.payout_per_1k;
+  });
+  return eligible[0] ?? null;
 }
 
-export function earningsSummary(device_id: string) {
-  const subs = listSubmissions(device_id);
-  const total = subs.reduce((acc, s) => acc + (s.earned_usd ?? 0), 0);
+/* ---------------- jobs ---------------- */
+
+export async function enqueueJob(job: Job): Promise<void> {
+  await kv.set(`job:${job.id}`, job);
+  await addToIdx(`queue:${job.device_id}`, job.id);
+}
+
+export async function getJob(id: string): Promise<Job | null> {
+  const v = await kv.get(`job:${id}`);
+  return (v as Job) ?? null;
+}
+
+/**
+ * Claim the oldest queued job for a device, atomically (CAS on updated_at)
+ * so two pollers can never run the same job.
+ */
+export async function claimJob(device_id: string): Promise<Job | null> {
+  const ids = await getIdx(`queue:${device_id}`);
+  for (const id of ids) {
+    const row = await getWithTs(`job:${id}`);
+    const job = row?.value as Job | null;
+    if (!job || job.status !== "queued") continue;
+    const claimed: Job = {
+      ...job,
+      status: "running",
+      updated_at: new Date().toISOString(),
+    };
+    const ok = dbEnabled
+      ? await supabaseKV.cas(`job:${id}`, claimed, row.updated_at)
+      : await mem.cas(`job:${id}`, claimed, row.updated_at);
+    if (ok) return claimed;
+    // lost the race — try next
+  }
+  return null;
+}
+
+export async function requeueJob(id: string): Promise<Job | null> {
+  const job = await getJob(id);
+  if (!job) return null;
+  job.status = "queued";
+  job.updated_at = new Date().toISOString();
+  await kv.set(`job:${id}`, job);
+  return job;
+}
+
+export async function finishJob(
+  id: string,
+  status: JobStatus,
+  result: unknown
+): Promise<Job | null> {
+  const job = await getJob(id);
+  if (!job) return null;
+  job.status = status;
+  job.result = result;
+  job.updated_at = new Date().toISOString();
+  await kv.set(`job:${id}`, job);
+  return job;
+}
+
+export async function listJobs(device_id: string): Promise<Job[]> {
+  const ids = await getIdx(`queue:${device_id}`);
+  const out: Job[] = [];
+  for (const id of ids) {
+    const j = await getJob(id);
+    if (j) out.push(j);
+  }
+  return out.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+}
+
+/* ---------------- submissions & earnings ---------------- */
+
+export async function recordSubmission(s: Submission): Promise<void> {
+  await kv.set(`submission:${s.id}`, s);
+  await addToIdx(`submissions:${s.device_id}`, s.id);
+}
+
+export async function updateSubmissionViews(
+  id: string,
+  views: number,
+  earned_usd: number
+): Promise<void> {
+  const v = (await kv.get(`submission:${id}`)) as Submission | null;
+  if (!v) return;
+  v.views = views;
+  v.earned_usd = earned_usd;
+  await kv.set(`submission:${id}`, v);
+}
+
+export async function earningsSummary(device_id: string): Promise<{
+  submissions: Submission[];
+  total_earned_usd: number;
+  pending_count: number;
+}> {
+  const ids = await getIdx(`submissions:${device_id}`);
+  const submissions: Submission[] = [];
+  for (const id of ids) {
+    const s = (await kv.get(`submission:${id}`)) as Submission | null;
+    if (s) submissions.push(s);
+  }
   return {
-    submissions: subs,
-    total_earned_usd: Math.round(total * 100) / 100,
-    pending_count: subs.filter((s) => s.status === "submitted" || s.status === "pending").length,
+    submissions,
+    total_earned_usd: submissions.reduce((t, s) => t + (s.earned_usd ?? 0), 0),
+    pending_count: submissions.filter(
+      (s) => s.status === "submitted" || s.status === "pending"
+    ).length,
   };
 }

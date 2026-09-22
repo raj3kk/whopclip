@@ -11,5 +11,5 @@ export async function GET(req: NextRequest) {
   if (!device_id) {
     return NextResponse.json({ error: "device_id required" }, { status: 400 });
   }
-  return NextResponse.json({ device_id, ...earningsSummary(device_id) });
+  return NextResponse.json({ device_id, ...(await earningsSummary(device_id)) });
 }
