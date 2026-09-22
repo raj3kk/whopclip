@@ -31,6 +31,15 @@ class PollService : Service() {
             else ctx.startService(i)
         }
 
+        /** Real stop: kills the foreground service + cancels periodic work. */
+        fun stop(ctx: Context) {
+            try { ctx.stopService(Intent(ctx, PollService::class.java)) } catch (_: Exception) { }
+            try {
+                if (WorkHelper.isReady(ctx))
+                    WorkManager.getInstance(ctx).cancelUniqueWork(WORK_NAME)
+            } catch (_: Exception) { }
+        }
+
         fun schedulePeriodic(ctx: Context) {
             // Lazy init: Application no longer touches WorkManager at launch.
             if (!WorkHelper.ensure(ctx)) return

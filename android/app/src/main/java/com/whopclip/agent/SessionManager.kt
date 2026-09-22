@@ -65,6 +65,27 @@ object SessionManager {
     fun isIgLinked(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_IG_DONE, false)
     fun isPaired(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_PAIRED, false)
 
+    private const val KEY_ONLINE = "online"
+
+    /** Local online/offline flag — automation only polls while true. */
+    fun isOnline(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_ONLINE, false)
+    fun setOnline(ctx: Context, online: Boolean) {
+        prefs(ctx).edit().putBoolean(KEY_ONLINE, online).apply()
+    }
+
+    /** Full unpair: clears pairing, sessions, online flag. Device must re-pair. */
+    fun unpair(ctx: Context) {
+        prefs(ctx).edit()
+            .putBoolean(KEY_PAIRED, false)
+            .putBoolean(KEY_ONLINE, false)
+            .putBoolean(KEY_WHOP_DONE, false)
+            .putBoolean(KEY_IG_DONE, false)
+            .putString(KEY_DEVICE_ID, null)
+            .apply()
+        // Fresh device identity on next pair.
+        deviceId(ctx)
+    }
+
     /**
      * Claims a website-generated pairing code (POST /api/pair action=claim).
      * Links this phone to the owner's dashboard permanently.

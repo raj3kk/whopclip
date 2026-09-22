@@ -1,0 +1,11 @@
+# Build artifacts - never commit
+android/build-manual/
+android/deps/
+android/build/
+android/.gradle/
+server/node_modules/
+server/package-lock.json
+server/tsconfig.tsbuildinfo
+server/.next/
+*.apk
+*.aab

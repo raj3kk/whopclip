@@ -35,6 +35,11 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
                 Log.i(TAG, "unpaired device — polling skipped")
                 return@withContext Result.success()
             }
+            // Online gate: user tapped "Offline" — no polling until "Online".
+            if (!SessionManager.isOnline(applicationContext)) {
+                Log.i(TAG, "device offline — polling skipped")
+                return@withContext Result.success()
+            }
             ensureSessionsOnServer()
             val job = claimJob() ?: return@withContext Result.success()
             Log.i(TAG, "claimed job ${job.optString("id")} type=${job.optString("type")}")

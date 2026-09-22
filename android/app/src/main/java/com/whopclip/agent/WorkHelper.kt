@@ -40,4 +40,12 @@ object WorkHelper {
     fun isReady(ctx: Context): Boolean = try {
         WorkManager.getInstance(ctx); true
     } catch (_: Throwable) { false }
+
+    /** Cancels the periodic poll work (offline/disconnect path). */
+    fun cancel(ctx: Context) {
+        try {
+            if (isReady(ctx))
+                WorkManager.getInstance(ctx).cancelUniqueWork(PollService.WORK_NAME)
+        } catch (_: Throwable) { }
+    }
 }

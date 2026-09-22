@@ -1,6 +1,7 @@
 package com.whopclip.agent
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -16,7 +17,6 @@ import android.widget.Button
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -25,8 +25,12 @@ import kotlinx.coroutines.launch
  * One-time login screen. Two tabs — Whop and Instagram — each a full
  * WebView where the user signs in normally. When the page looks like a
  * logged-in landing page, we grab the session cookies and upload them.
+ *
+ * v9: extends platform Activity (not AppCompatActivity) — the AppCompat
+ * base was crashing on launch on some devices (tap Instagram/Whop → instant
+ * back-out). Root fix matching MainActivity's v6 conversion.
  */
-class LoginActivity : AppCompatActivity() {
+class LoginActivity : Activity() {
 
     companion object {
         const val EXTRA_SERVICE = "service" // "whop" or "instagram"

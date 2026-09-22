@@ -551,6 +551,25 @@ export function deviceOnline(d: Device): boolean {
   return Date.now() - new Date(d.last_poll_at).getTime() < 5 * 60 * 1000;
 }
 
+/** Explicit online/offline presence from the phone's Profile tab. */
+export async function setDevicePresence(device_id: string, online: boolean): Promise<void> {
+  const existing = await getDevice(device_id);
+  if (!existing) return;
+  await kv.set(`device:${device_id}`, {
+    ...existing,
+    last_poll_at: online ? new Date().toISOString() : null,
+    presence: online ? "online" : "offline",
+  });
+}
+
+/** Full disconnect: removes the device registration (unpair). */
+export async function disconnectDevice(device_id: string): Promise<void> {
+  // KVBackend has no delete — null the record and drop from the index.
+  await kv.set(`device:${device_id}`, null);
+  const ids = await getIdx("devices");
+  await kv.set("idx:devices", ids.filter((id) => id !== device_id));
+}
+
 /* ---------------- automation schedule ---------------- */
 
 export interface Schedule {

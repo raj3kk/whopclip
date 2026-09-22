@@ -53,6 +53,14 @@ class JobEngine(private val ctx: Context) {
 
     class JobFailed(msg: String) : Exception(msg)
 
+    companion object {
+        /** In-memory tracker of the currently running job, for the Live tab. */
+        @Volatile private var currentJobDesc: String? = null
+
+        fun setCurrentJob(desc: String?) { currentJobDesc = desc }
+        fun currentJobInfo(): String? = currentJobDesc
+    }
+
     @Volatile private var lastJsResult: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -262,6 +270,9 @@ class JobEngine(private val ctx: Context) {
             val extracted = JSONObject()
             val steps: JSONArray = job.optJSONArray("steps") ?: JSONArray()
             val ownsWebView = externalWebView == null
+            val jobDesc = "${job.optString("type", "job")} ${job.optString("id", "").take(8)}"
+            setCurrentJob("Chal raha: $jobDesc (${steps.length()} steps)")
+            Log.i(TAG, "job start: $jobDesc")
 
             val wv: WebView = if (externalWebView != null) {
                 suspendCancellableCoroutine { cont ->
@@ -422,6 +433,8 @@ class JobEngine(private val ctx: Context) {
                 }
             } finally {
                 if (ownsWebView) mainHandler.post { wv.destroy() }
+                setCurrentJob(null)
+                Log.i(TAG, "job done: $jobDesc")
             }
             extracted
         }
