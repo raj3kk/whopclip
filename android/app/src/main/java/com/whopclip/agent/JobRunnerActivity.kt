@@ -1,0 +1,163 @@
+package com.whopclip.agent
+
+import android.annotation.SuppressLint
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.view.View
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.widget.ProgressBar
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+/**
+ * Foreground job runner. Opened from the "upload ready" notification (or
+ * manually) when a job needs the system file picker — something a
+ * background WebView cannot do. Hosts the WebView, wires
+ * onShowFileChooser -> system picker -> UploadBridge, and runs the job
+ * through JobEngine.
+ */
+class JobRunnerActivity : AppCompatActivity() {
+
+    private lateinit var webView: WebView
+    private lateinit var statusText: TextView
+    private lateinit var progress: ProgressBar
+    private var filePathCallback: ValueCallback<Array<Uri>>? = null
+
+    private val filePicker =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            val cb = filePathCallback
+            filePathCallback = null
+            if (result.resultCode == RESULT_OK) {
+                val uri: Uri? = result.data?.data
+                UploadBridge.signal(uri != null)
+                cb?.onReceiveValue(if (uri != null) arrayOf(uri) else null)
+            } else {
+                UploadBridge.signal(false)
+                cb?.onReceiveValue(null)
+            }
+        }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_job_runner)
+        title = "WhopClip job chal raha hai"
+
+        webView = findViewById(R.id.jobWebView)
+        statusText = findViewById(R.id.jobStatus)
+        progress = findViewById(R.id.jobProgress)
+
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            mediaPlaybackRequiresUserGesture = false
+        }
+        android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                view: WebView?,
+                callback: ValueCallback<Array<Uri>>?,
+                params: FileChooserParams?
+            ): Boolean {
+                filePathCallback?.onReceiveValue(null)
+                filePathCallback = callback
+                UploadBridge.arm()
+                val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                    type = "video/*"
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                }
+                return try {
+                    filePicker.launch(intent)
+                    true
+                } catch (e: Exception) {
+                    filePathCallback = null
+                    UploadBridge.signal(false)
+                    false
+                }
+            }
+        }
+
+        runNextJob()
+    }
+
+    private fun runNextJob() {
+        statusText.text = "Job le rahe hain…"
+        progress.visibility = View.VISIBLE
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val job = claimJob() ?: runOnUiThread {
+                    statusText.text = "Koi job nahi hai"
+                    progress.visibility = View.GONE
+                }.let { return@launch }
+
+                runOnUiThread { statusText.text = "Job chal raha hai: ${job.optString("type")}" }
+                try {
+                    val out = JobEngine(this@JobRunnerActivity).run(job, webView)
+                    reportJob(job.getString("id"), "done", out)
+                    runOnUiThread {
+                        statusText.text = "Job ho gaya ✓"
+                        progress.visibility = View.GONE
+                        Toast.makeText(this@JobRunnerActivity, "Job complete ✓", Toast.LENGTH_SHORT).show()
+                    }
+                } catch (e: Exception) {
+                    reportJob(job.getString("id"), "failed",
+                        JSONObject().put("error", e.message ?: "unknown"))
+                    runOnUiThread {
+                        statusText.text = "Job fail: ${e.message}"
+                        progress.visibility = View.GONE
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    statusText.text = "Error: ${e.message}"
+                    progress.visibility = View.GONE
+                }
+            }
+        }
+    }
+
+    private fun claimJob(): JSONObject? {
+        val deviceId = SessionManager.deviceId(this)
+        val url = "${SessionManager.serverUrl(this)}/api/jobs/next?device_id=$deviceId"
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 20000; readTimeout = 20000
+        }
+        return try {
+            if (conn.responseCode == 204) null
+            else JSONObject(conn.inputStream.bufferedReader().readText()).optJSONObject("job")
+        } finally { conn.disconnect() }
+    }
+
+    private fun reportJob(id: String, status: String, result: JSONObject) {
+        val url = "${SessionManager.serverUrl(this)}/api/jobs/$id"
+        val body = JSONObject().put("status", status).put("result", result)
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            connectTimeout = 20000; readTimeout = 20000
+            doOutput = true
+        }
+        try {
+            conn.outputStream.bufferedWriter().use { it.write(body.toString()) }
+            conn.responseCode
+        } finally { conn.disconnect() }
+    }
+
+    override fun onDestroy() {
+        filePathCallback?.onReceiveValue(null)
+        filePathCallback = null
+        webView.destroy()
+        super.onDestroy()
+    }
+}

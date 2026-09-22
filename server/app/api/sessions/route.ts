@@ -22,6 +22,7 @@ export async function POST(req: NextRequest) {
       encrypted,
       user_agent: user_agent ?? "",
       device_model: device_model ?? "",
+      stale: false,
       created_at: now,
       updated_at: now,
     });

@@ -1,28 +1,75 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSession } from "@/lib/store";
+import {
+  getSession,
+  listCampaigns,
+  parseRequirements,
+  selectCampaign,
+  upsertCampaign,
+  type Campaign,
+} from "@/lib/store";
 
 /**
- * GET /api/campaigns?device_id=...
- * v1: returns the campaign pipeline state for this device.
- * Campaign discovery (Whop Content Rewards list via stored session)
- * is implemented in the orchestrator step — this skeleton returns a
- * placeholder so the API contract is stable.
+ * GET  /api/campaigns?device_id=... -> campaign list for this device
+ * POST /api/campaigns { action:"select", device_id } -> best eligible campaign
+ *   (active + budget>0 + not already submitted; prefers joined, then payout)
+ * POST /api/campaigns { action:"upsert", campaign } -> add/update campaign record
  */
 export async function GET(req: NextRequest) {
   const device_id = req.nextUrl.searchParams.get("device_id");
   if (!device_id) {
     return NextResponse.json({ error: "device_id required" }, { status: 400 });
   }
-  const whop = getSession(device_id, "whop");
-  if (!whop) {
+  if (!getSession(device_id, "whop")) {
     return NextResponse.json({ error: "whop not linked" }, { status: 409 });
   }
-  // TODO(orchestrator): use decrypted whop cookies to fetch
-  // https://whop.com/content-rewards / experience campaigns, join state,
-  // and requirements. For now the phone drives discovery via JobEngine.
-  return NextResponse.json({
-    device_id,
-    campaigns: [],
-    note: "campaign discovery not yet implemented server-side; use job queue to drive phone WebView",
-  });
+  return NextResponse.json({ device_id, campaigns: listCampaigns() });
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    if (body?.action === "select") {
+      const { device_id } = body;
+      if (!device_id) {
+        return NextResponse.json({ error: "device_id required" }, { status: 400 });
+      }
+      const campaign = selectCampaign(device_id);
+      if (!campaign) {
+        return NextResponse.json(
+          { campaign: null, reason: "no eligible campaign (inactive / no budget / already submitted)" }
+        );
+      }
+      return NextResponse.json({ campaign });
+    }
+    if (body?.action === "upsert") {
+      const c = body.campaign as Partial<Campaign>;
+      if (!c?.id || !c?.name || !c?.whop_url) {
+        return NextResponse.json(
+          { error: "campaign.id, campaign.name, campaign.whop_url required" },
+          { status: 400 }
+        );
+      }
+      const now = new Date().toISOString();
+      const existing = listCampaigns().find((x) => x.id === c.id);
+      upsertCampaign({
+        id: c.id,
+        name: c.name,
+        whop_url: c.whop_url,
+        active: c.active !== false,
+        budget_remaining: typeof c.budget_remaining === "number" ? c.budget_remaining : 0,
+        payout_per_1k: typeof c.payout_per_1k === "number" ? c.payout_per_1k : 0,
+        joined: c.joined === true,
+        requirements: c.requirements ? parseRequirements(c.requirements) : null,
+        created_at: existing?.created_at ?? now,
+        updated_at: now,
+      });
+      return NextResponse.json({ ok: true, id: c.id });
+    }
+    return NextResponse.json({ error: "action must be select|upsert" }, { status: 400 });
+  } catch (e: unknown) {
+    return NextResponse.json(
+      { error: e instanceof Error ? e.message : "unknown" },
+      { status: 500 }
+    );
+  }
 }

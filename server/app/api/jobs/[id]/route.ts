@@ -1,11 +1,29 @@
 import { NextRequest, NextResponse } from "next/server";
-import { enqueueJob, finishJob, listJobs, type Job, type JobStatus } from "@/lib/store";
+import {
+  alreadySubmitted,
+  enqueueJob,
+  finishJob,
+  getCampaign,
+  listJobs,
+  markSessionStale,
+  recordSubmission,
+  requeueJob,
+  type Job,
+  type JobStatus,
+  type ServiceName,
+} from "@/lib/store";
 import crypto from "crypto";
 
 /**
- * POST /api/jobs/:id        -> phone reports { status: "done"|"failed", result }
- * POST /api/jobs/enqueue    -> orchestrator enqueues { device_id, type, steps }
- * GET  /api/jobs?device_id= -> list jobs for a device (debug/monitor)
+ * POST /api/jobs/enqueue -> orchestrator enqueues { device_id, type, steps, campaign_id? }
+ * POST /api/jobs/:id    -> phone reports:
+ *    { status:"done"|"failed", result } |
+ *    { status:"requeue" }                       (e.g. upload needs foreground)
+ *    result.session_expired=true + result.service -> marks that session stale
+ *    (checkpoint 10)
+ *    whop_submit done + result.campaign_id/ig_post_url -> records submission
+ *    (checkpoints 1 + 9: duplicate prevention + earnings ledger)
+ * GET  /api/jobs?device_id= -> list jobs for a device (monitor)
  */
 export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
   if (params.id === "enqueue") {
@@ -37,11 +55,50 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
   try {
     const body = await req.json();
     const { status, result } = body ?? {};
-    if (status !== "done" && status !== "failed") {
-      return NextResponse.json({ error: "status must be done|failed" }, { status: 400 });
+
+    if (status === "requeue") {
+      const job = requeueJob(params.id);
+      if (!job) return NextResponse.json({ error: "job not found" }, { status: 404 });
+      return NextResponse.json({ ok: true, job });
     }
+
+    if (status !== "done" && status !== "failed") {
+      return NextResponse.json({ error: "status must be done|failed|requeue" }, { status: 400 });
+    }
+
+    // Checkpoint 10: session expired -> flag for re-login prompt.
+    const r = (result ?? {}) as Record<string, unknown>;
+    if (r.session_expired === true && (r.service === "whop" || r.service === "instagram")) {
+      const job0 = finishJob(params.id, status as JobStatus, result ?? null);
+      markSessionStale(job0?.device_id ?? "", r.service as ServiceName);
+      return NextResponse.json({ ok: true, job: job0, session_stale: r.service });
+    }
+
     const job = finishJob(params.id, status as JobStatus, result ?? null);
     if (!job) return NextResponse.json({ error: "job not found" }, { status: 404 });
+
+    // Checkpoints 1+9: successful Whop submit -> earnings ledger (dup-proof).
+    if (job.type === "whop_submit" && status === "done") {
+      const campaign_id = typeof r.campaign_id === "string" ? r.campaign_id : "";
+      const ig_post_url = typeof r.ig_post_url === "string" ? r.ig_post_url : "";
+      if (campaign_id && ig_post_url && !alreadySubmitted(job.device_id, campaign_id)) {
+        const camp = getCampaign(campaign_id);
+        const now = new Date().toISOString();
+        recordSubmission({
+          id: crypto.randomUUID(),
+          device_id: job.device_id,
+          campaign_id,
+          campaign_name: camp?.name ?? campaign_id,
+          ig_post_url,
+          status: "submitted",
+          payout_per_1k: camp?.payout_per_1k ?? 0,
+          views: null,
+          earned_usd: null,
+          created_at: now,
+        });
+      }
+    }
+
     return NextResponse.json({ ok: true, job });
   } catch (e: unknown) {
     return NextResponse.json({ error: e instanceof Error ? e.message : "unknown" }, { status: 500 });
