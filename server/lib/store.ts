@@ -16,6 +16,7 @@
  */
 
 import { dbEnabled, supabaseKV, type KVBackend } from "./db";
+import crypto from "crypto";
 
 export type ServiceName = "whop" | "instagram";
 export type JobStatus = "queued" | "running" | "done" | "failed";
@@ -360,4 +361,175 @@ export async function earningsSummary(device_id: string): Promise<{
       (s) => s.status === "submitted" || s.status === "pending"
     ).length,
   };
+}
+
+/* ---------------- device pairing ---------------- */
+
+export interface PairCode {
+  code: string;
+  created_at: string;
+  expires_at: string;
+  claimed_by: string | null;
+  claimed_at: string | null;
+}
+
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+export function generatePairCode(): string {
+  // 8 Crockford chars, shown as XXXX-XXXX (no ambiguous I/L/O/U)
+  let s = "";
+  const buf = crypto.randomBytes(8);
+  for (let i = 0; i < 8; i++) s += CROCKFORD[buf[i] % 32];
+  return `${s.slice(0, 4)}-${s.slice(4)}`;
+}
+
+export async function createPairCode(ttlMinutes = 10): Promise<PairCode> {
+  const now = new Date();
+  const p: PairCode = {
+    code: generatePairCode(),
+    created_at: now.toISOString(),
+    expires_at: new Date(now.getTime() + ttlMinutes * 60000).toISOString(),
+    claimed_by: null,
+    claimed_at: null,
+  };
+  await kv.set(`pair:${p.code}`, p);
+  return p;
+}
+
+export async function getPairCode(code: string): Promise<PairCode | null> {
+  const v = await kv.get(`pair:${code.toUpperCase()}`);
+  return (v as PairCode) ?? null;
+}
+
+export async function claimPairCode(
+  code: string,
+  device_id: string
+): Promise<PairCode | null> {
+  const p = await getPairCode(code);
+  if (!p) return null;
+  if (p.claimed_by) return p; // already claimed — idempotent
+  if (new Date(p.expires_at).getTime() < Date.now()) return null;
+  p.claimed_by = device_id;
+  p.claimed_at = new Date().toISOString();
+  await kv.set(`pair:${p.code}`, p);
+  return p;
+}
+
+/* ---------------- linked devices ---------------- */
+
+export interface Device {
+  device_id: string;
+  paired_at: string;
+  last_poll_at: string | null;
+  app_version: string | null;
+  device_model: string | null;
+}
+
+export async function registerDevice(d: Device): Promise<void> {
+  const existing = await getDevice(d.device_id);
+  await kv.set(`device:${d.device_id}`, { ...existing, ...d, device_id: d.device_id });
+  await addToIdx("devices", d.device_id);
+}
+
+export async function getDevice(device_id: string): Promise<Device | null> {
+  const v = await kv.get(`device:${device_id}`);
+  return (v as Device) ?? null;
+}
+
+export async function listDevices(): Promise<Device[]> {
+  const ids = await getIdx("devices");
+  const out: Device[] = [];
+  for (const id of ids) {
+    const d = await getDevice(id);
+    if (d) out.push(d);
+  }
+  return out.sort((a, b) => (a.paired_at < b.paired_at ? 1 : -1));
+}
+
+/** Update last-poll heartbeat (and optional fields) for a device. */
+export async function touchDevice(
+  device_id: string,
+  patch: Partial<Pick<Device, "app_version" | "device_model">> = {}
+): Promise<void> {
+  if (!device_id) return;
+  const existing = await getDevice(device_id);
+  const now = new Date().toISOString();
+  if (existing) {
+    await kv.set(`device:${device_id}`, {
+      ...existing,
+      ...patch,
+      last_poll_at: now,
+    });
+  } else {
+    // auto-register unknown pollers (phone installed before pairing UI existed)
+    await registerDevice({
+      device_id,
+      paired_at: now,
+      last_poll_at: now,
+      app_version: patch.app_version ?? null,
+      device_model: patch.device_model ?? null,
+    });
+  }
+}
+
+/** Online = polled within the last 5 minutes. */
+export function deviceOnline(d: Device): boolean {
+  if (!d.last_poll_at) return false;
+  return Date.now() - new Date(d.last_poll_at).getTime() < 5 * 60 * 1000;
+}
+
+/* ---------------- automation schedule ---------------- */
+
+export interface Schedule {
+  device_id: string;
+  enabled: boolean;
+  /** daily run time "HH:MM" in the device timezone */
+  time: string;
+  timezone: string;
+  last_run_date: string | null; // YYYY-MM-DD
+  updated_at: string;
+}
+
+const DEFAULT_SCHEDULE = { enabled: false, time: "09:00", timezone: "Asia/Calcutta" };
+
+export async function getSchedule(device_id: string): Promise<Schedule> {
+  const v = (await kv.get(`schedule:${device_id}`)) as Schedule | null;
+  if (v) return v;
+  return {
+    device_id,
+    ...DEFAULT_SCHEDULE,
+    last_run_date: null,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+export async function setSchedule(s: Omit<Schedule, "updated_at">): Promise<Schedule> {
+  const full: Schedule = { ...s, updated_at: new Date().toISOString() };
+  await kv.set(`schedule:${s.device_id}`, full);
+  return full;
+}
+
+/** Is a scheduled run due right now? (enabled + time passed today + not run today) */
+export function scheduleDue(s: Schedule, now = new Date()): boolean {
+  if (!s.enabled) return false;
+  const today = now.toISOString().slice(0, 10);
+  if (s.last_run_date === today) return false;
+  const [h, m] = s.time.split(":").map((x) => parseInt(x, 10));
+  if (Number.isNaN(h) || Number.isNaN(m)) return false;
+  // compare in the schedule's timezone via Intl
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: s.timezone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(now);
+  const hh = parseInt(parts.find((p) => p.type === "hour")!.value, 10);
+  const mm = parseInt(parts.find((p) => p.type === "minute")!.value, 10);
+  return hh * 60 + mm >= h * 60 + m;
+}
+
+export async function markScheduleRun(device_id: string): Promise<void> {
+  const s = await getSchedule(device_id);
+  s.last_run_date = new Date().toISOString().slice(0, 10);
+  await setSchedule(s);
 }

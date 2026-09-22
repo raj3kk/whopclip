@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { claimJob } from "@/lib/store";
+import { claimJob, touchDevice } from "@/lib/store";
 
 /**
  * GET /api/jobs/next?device_id=...
@@ -11,6 +11,11 @@ export async function GET(req: NextRequest) {
   if (!device_id) {
     return NextResponse.json({ error: "device_id required" }, { status: 400 });
   }
+  // heartbeat: dashboard "phone status" reads this
+  touchDevice(device_id, {
+    app_version: req.nextUrl.searchParams.get("app_version") ?? undefined,
+    device_model: req.nextUrl.searchParams.get("device_model") ?? undefined,
+  }).catch(() => {});
   const job = await claimJob(device_id);
   if (!job) return new NextResponse(null, { status: 204 });
   return NextResponse.json({ job });
