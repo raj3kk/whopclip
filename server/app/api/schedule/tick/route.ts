@@ -8,11 +8,14 @@ import {
 import { enqueueRunStep, RunError } from "@/lib/run";
 
 /**
- * GET /api/schedule/tick — server cron (every 15 min via vercel.json).
+ * GET /api/schedule/tick — server cron (daily via vercel.json; Hobby plan
+ * allows only one cron run per day).
  *
- * Auth: x-cron-secret header must equal CRON_SECRET env. If CRON_SECRET is
- * not configured the endpoint is unavailable (503) — see README "Schedule
- * cron" section.
+ * Auth: the request must carry the cron secret, either as the
+ * `x-cron-secret` header or as `Authorization: Bearer <secret>`.
+ * Vercel's own scheduler invokes this path from vercel.json; external
+ * callers (e.g. a manual trigger script) use the same headers.
+ * If CRON_SECRET is not configured the endpoint is unavailable (503).
  *
  * For every registered device whose schedule is due, enqueues a "check" run
  * (the start of the campaign pipeline) and marks the schedule run so it
@@ -29,7 +32,9 @@ export async function GET(req: NextRequest) {
       { status: 503 }
     );
   }
-  const given = req.headers.get("x-cron-secret");
+  const given =
+    req.headers.get("x-cron-secret") ??
+    req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   if (!given || given !== secret) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
