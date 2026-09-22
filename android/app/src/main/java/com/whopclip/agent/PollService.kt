@@ -32,6 +32,8 @@ class PollService : Service() {
         }
 
         fun schedulePeriodic(ctx: Context) {
+            // Lazy init: Application no longer touches WorkManager at launch.
+            if (!WorkHelper.ensure(ctx)) return
             val req = PeriodicWorkRequestBuilder<PollWorker>(15, TimeUnit.MINUTES).build()
             WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(
                 WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, req

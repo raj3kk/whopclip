@@ -2,38 +2,57 @@ package com.whopclip.agent
 
 import android.app.Application
 import android.util.Log
-import androidx.work.Configuration
-import androidx.work.WorkManager
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * Manual WorkManager init (we don't use androidx.startup's InitializationProvider,
- * so the manifest stays minimal and deterministic).
+ * v6: Application does NOTHING except install a crash recorder.
  *
- * Hardening (v5): WorkManager init must NEVER kill the app at launch. If the
- * init throws on some device, we stash the error (shown in MainActivity status)
- * and let the app open so the user can still pair / see diagnostics.
+ * Root-cause history: v3/v4/v5 crashed immediately on launch on the user's
+ * phone. v5 wrapped WorkManager.getInstance() in try/catch but the crash
+ * persisted, proving the crash was NOT in that call. Suspects eliminated by
+ * removal: eager WorkManager Configuration property (ran before onCreate,
+ * outside any try/catch), AppCompat on the launch path.
+ *
+ * WorkManager is now initialized LAZILY (see WorkHelper) only when the user
+ * actually starts automation — never at app launch.
+ *
+ * If anything still crashes at startup, the uncaught-exception handler writes
+ * the full stack trace to <files>/crash.log and the next launch shows it in
+ * the diagnostic card instead of silently dying.
  */
-class WhopClipApp : Application(), Configuration.Provider {
+class WhopClipApp : Application() {
     companion object {
         private const val TAG = "WhopClipApp"
-        @Volatile var workInitError: String? = null
-            private set
-    }
+        const val CRASH_FILE = "crash.log"
 
-    override val workManagerConfiguration: Configuration =
-        Configuration.Builder()
-            .setMinimumLoggingLevel(android.util.Log.INFO)
-            .build()
+        fun readCrashLog(app: Application): String? = try {
+            val f = File(app.filesDir, CRASH_FILE)
+            if (f.exists()) f.readText() else null
+        } catch (_: Exception) { null }
+
+        fun clearCrashLog(app: Application) = try {
+            File(app.filesDir, CRASH_FILE).delete()
+        } catch (_: Exception) { }
+    }
 
     override fun onCreate() {
         super.onCreate()
-        // Trigger init early so PollWorker can be enqueued from any activity.
-        // Wrapped: a WorkManager init failure must not crash the launch.
-        try {
-            WorkManager.getInstance(this)
-        } catch (t: Throwable) {
-            workInitError = "${t.javaClass.simpleName}: ${t.message}"
-            Log.e(TAG, "WorkManager init failed (non-fatal)", t)
+        val app = this
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                val ts = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+                val sw = java.io.StringWriter()
+                throwable.printStackTrace(java.io.PrintWriter(sw))
+                val report = "[$ts] thread=${thread.name}\n${throwable}\n${sw}\n"
+                File(app.filesDir, CRASH_FILE).appendText(report)
+                Log.e(TAG, "crash recorded", throwable)
+            } catch (_: Exception) { }
+            prev?.uncaughtException(thread, throwable)
         }
+        Log.i(TAG, "WhopClipApp started (v6, no WorkManager at launch)")
     }
 }

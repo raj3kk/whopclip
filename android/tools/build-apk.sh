@@ -12,8 +12,8 @@ BT="$SDK/build-tools/34.0.0"
 PLATFORM="$SDK/platforms/android-34/android.jar"
 KOTLINC="$HOME/workspace/.kotlin/kotlinc/bin/kotlinc"
 
-VERSION_CODE="${VERSION_CODE:-5}"
-VERSION_NAME="${VERSION_NAME:-1.0.3}"
+VERSION_CODE="${VERSION_CODE:-6}"
+VERSION_NAME="${VERSION_NAME:-1.0.4}"
 APP_ID="com.whopclip.agent"
 
 rm -rf "$OUT"

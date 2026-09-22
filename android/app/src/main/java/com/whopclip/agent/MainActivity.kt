@@ -1,6 +1,7 @@
 package com.whopclip.agent
 
 import android.Manifest
+import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -8,19 +9,16 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
-import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
- * Home screen: shows link status for Whop + Instagram, buttons to
- * (re)login, server URL config, and start/stop of background polling.
+ * v6: extends platform android.app.Activity (not AppCompat).
+ * Launch path is now: Application (trivial) -> Activity (trivial) ->
+ * setContentView (plain LinearLayout). No WorkManager, no AppCompat on the
+ * launch path. WorkManager initializes lazily via WorkHelper only when the
+ * user taps "Automation start karo".
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : Activity() {
 
     private lateinit var statusText: TextView
     private lateinit var versionText: TextView
@@ -45,15 +43,12 @@ class MainActivity : AppCompatActivity() {
         val startBtn: Button = findViewById(R.id.startBtn)
         val pairBtn: Button = findViewById(R.id.pairBtn)
 
-        // Android 13+: PollWorker's notifications (upload-ready prompt) are
-        // silently dropped without this runtime grant. Ask once up front.
+        // Android 13+: PollWorker's notifications are silently dropped
+        // without this runtime grant. Ask once up front.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS
-            )
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS)
         }
 
         serverInput.setText(SessionManager.serverUrl(this))
@@ -81,6 +76,12 @@ class MainActivity : AppCompatActivity() {
             }
             if (!SessionManager.isWhopLinked(this) || !SessionManager.isIgLinked(this)) {
                 Toast.makeText(this, "Pehle Whop + Instagram dono me login karo",
+                    Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            // Lazy WorkManager init — first and only touch at user action.
+            if (!WorkHelper.ensure(this)) {
+                Toast.makeText(this, "WorkManager start nahi hua — dobara try karo",
                     Toast.LENGTH_LONG).show()
                 return@setOnClickListener
             }
@@ -115,16 +116,16 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshStatus()
-        checkStaleSessions()
     }
 
     private fun refreshStatus() {
         val whop = if (SessionManager.isWhopLinked(this)) "✓ linked" else "✗ not linked"
         val ig = if (SessionManager.isIgLinked(this)) "✓ linked" else "✗ not linked"
         val paired = if (SessionManager.isPaired(this)) "✓ paired" else "✗ not paired"
-        val wmErr = WhopClipApp.workInitError
-        val wm = if (wmErr == null) "✓ ok" else "✗ $wmErr"
-        statusText.text = "Whop: $whop\nInstagram: $ig\nPairing: $paired\nWorkManager: $wm\nDevice: ${SessionManager.deviceId(this).take(8)}…"
+        val wm = if (WorkHelper.isReady(this)) "✓ ok" else "– standby"
+        val crash = (application as WhopClipApp).let { WhopClipApp.readCrashLog(it) }
+        val crashLine = if (crash != null) "\n⚠ pichla crash: ${crash.lines().firstOrNull { it.isNotBlank() } ?: ""}" else ""
+        statusText.text = "Whop: $whop\nInstagram: $ig\nPairing: $paired\nWorkManager: $wm\nDevice: ${SessionManager.deviceId(this).take(8)}…$crashLine"
         versionText.text = "v${appVersionName()} (${SessionManager.appVersionCode(this)})"
     }
 
@@ -133,34 +134,4 @@ class MainActivity : AppCompatActivity() {
         val pi = packageManager.getPackageInfo(packageName, 0)
         pi.versionName ?: "?"
     } catch (_: Exception) { "?" }
-
-    /** Checkpoint 10 — server flagged a session expired -> prompt re-login. */
-    private fun checkStaleSessions() {
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-            try {
-                val deviceId = SessionManager.deviceId(this@MainActivity)
-                val url = "${SessionManager.serverUrl(this@MainActivity)}/api/sessions/status?device_id=$deviceId"
-                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 15000; readTimeout = 15000
-                }
-                val body = try {
-                    if (conn.responseCode != 200) return@launch
-                    JSONObject(conn.inputStream.bufferedReader().readText())
-                } finally { conn.disconnect() }
-                val services = body.optJSONObject("services") ?: return@launch
-                val stale = mutableListOf<String>()
-                if (services.optJSONObject("whop")?.optBoolean("stale") == true) stale.add("Whop")
-                if (services.optJSONObject("instagram")?.optBoolean("stale") == true) stale.add("Instagram")
-                if (stale.isNotEmpty()) {
-                    runOnUiThread {
-                        Toast.makeText(
-                            this@MainActivity,
-                            "${stale.joinToString(" + ")} session expire ho gaya — dobara login karo",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
-                }
-            } catch (_: Exception) { /* offline: ignore */ }
-        }
-    }
 }
