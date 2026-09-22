@@ -18,7 +18,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const device_id = typeof body?.device_id === "string" ? body.device_id : "";
     const step = typeof body?.step === "string" ? body.step : "check";
-    const { job, campaign } = await enqueueRunStep(device_id, step, {
+    const { job, campaign, chain } = await enqueueRunStep(device_id, step, {
       campaign_id: body?.campaign_id,
       caption: body?.caption,
       video_url: body?.video_url,
@@ -30,7 +30,9 @@ export async function POST(req: NextRequest) {
       ok: true,
       job_id: job.id,
       type: job.type,
-      campaign: { id: campaign.id, name: campaign.name },
+      chain_id: chain?.id ?? null,
+      campaign: campaign ? { id: campaign.id, name: campaign.name } : null,
+      discovering: !campaign && job.type === "whop_discover",
     });
   } catch (e: unknown) {
     if (e instanceof RunError) {

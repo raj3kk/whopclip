@@ -143,14 +143,30 @@ export function igPostJob(p: IgPostParams): Step[] {
  * Standalone live-reel verification: given a known post URL, load it and
  * confirm the reel is publicly playable with a real video element.
  * Run BEFORE whop_submit so a broken upload never gets submitted.
- * (Frame-level safe-zone checks at 1s/7s/15s/25s need the v6 screenshot
- * action; until then this DOM-level check plus the VM-side render validation
- * is the gate.)
+ *
+ * Frame-level proof: seeks the reel to ~1s/7s/15s/25s, captures a WebView
+ * screenshot at each point, and uploads it to POST /api/frames. The server
+ * (or dashboard reviewer) checks safe zones: hook/title >=10% below top,
+ * captions at/above ~78% height, clear of the bottom 20% and right 15%.
+ * Fail closed: any missing frame or unplayable video throws.
  */
 export function verifyReelJob(post_url: string): Step[] {
   if (!/^https?:\/\//i.test(post_url)) {
     throw new Error("verifyReelJob: post_url must be an absolute URL");
   }
+  const seekAndShoot = (t: number, key: string): Step[] => [
+    {
+      action: "js",
+      code: `(function(){
+        var v=document.querySelector('video');
+        if(!v) throw new Error('no video element for frame capture');
+        v.currentTime=${t};
+        return 'seek_${t}s';
+      })()`,
+    },
+    { action: "wait", ms: 1500 },
+    { action: "screenshot", key, upload: true },
+  ];
   return [
     { action: "goto", url: post_url },
     { action: "wait", ms: 5000 },
@@ -166,13 +182,18 @@ export function verifyReelJob(post_url: string): Step[] {
         return JSON.stringify({ok:true, url:location.href, duration_s:v.duration||null});
       })()`,
     },
+    // frame proof at 1s / 7s / 15s / 25s (uploaded to /api/frames)
+    ...seekAndShoot(1, "frame_1s.png"),
+    ...seekAndShoot(7, "frame_7s.png"),
+    ...seekAndShoot(15, "frame_15s.png"),
+    ...seekAndShoot(25, "frame_25s.png"),
     {
       action: "extract",
       key: "verify_result",
       code: `(function(){
         var t=document.body?document.body.innerText:'';
         var m=t.match(/([\\d,]+)\\s+likes/i);
-        return JSON.stringify({likes:m?m[1]:null, url:location.href});
+        return JSON.stringify({likes:m?m[1]:null, url:location.href, frames:['frame_1s.png','frame_7s.png','frame_15s.png','frame_25s.png']});
       })()`,
     },
   ];

@@ -21,6 +21,7 @@ import {
   getCampaign,
   getJob,
   kv,
+  upsertCampaign,
   type Campaign,
   type Job,
 } from "./store";
@@ -245,7 +246,16 @@ export async function onJobDone(job: Job): Promise<Chain | null> {
           await failChain(chain, "campaign vanished mid-chain");
           return chain;
         }
-        if (joinState === "joined" || campaign.joined) {
+        // Persist the parsed brief + join state on the campaign record so
+        // the dashboard and future runs see the ground truth.
+        const alreadyJoined = joinState === "joined" || campaign.joined;
+        await upsertCampaign({
+          ...campaign,
+          requirements: extraction.requirements,
+          joined: alreadyJoined,
+          updated_at: new Date().toISOString(),
+        });
+        if (alreadyJoined) {
           // skip join -> straight to render
           chain.stage = "render";
           await enqueueRenderStage(chain, campaign, extraction);
@@ -274,6 +284,13 @@ export async function onJobDone(job: Job): Promise<Chain | null> {
           await failChain(chain, "campaign vanished mid-chain");
           return chain;
         }
+        // The join job's js step throws unless the page shows a joined state,
+        // so reaching here means join succeeded — persist it.
+        await upsertCampaign({
+          ...campaign,
+          joined: true,
+          updated_at: new Date().toISOString(),
+        });
         const parsed = JSON.parse(chain.requirements_json ?? "{}");
         chain.stage = "render";
         await enqueueRenderStage(chain, campaign, {
@@ -285,7 +302,9 @@ export async function onJobDone(job: Job): Promise<Chain | null> {
       }
 
       case "post": {
-        const postUrl = resultStr(job.result, "post_url");
+        // Normalize: the phone reports `post_url`; accept `ig_post_url` too.
+        const postUrl =
+          resultStr(job.result, "post_url") || resultStr(job.result, "ig_post_url");
         if (!/^https?:\/\//i.test(postUrl)) {
           await failChain(chain, "post job finished without a valid post_url");
           return chain;
@@ -308,6 +327,19 @@ export async function onJobDone(job: Job): Promise<Chain | null> {
         const campaign = await getCampaign(chain.campaign_id);
         if (!campaign || !chain.ig_post_url) {
           await failChain(chain, "verify done but campaign/post URL missing");
+          return chain;
+        }
+        // Fail-closed frame proof: the verify job must have uploaded all four
+        // live-reel frames (1s/7s/15s/25s). Missing proof = no submit.
+        const frameKeys = ["frame_1s.png", "frame_7s.png", "frame_15s.png", "frame_25s.png"];
+        const missingFrames = frameKeys.filter(
+          (k) => !/^https?:\/\//i.test(resultStr(job.result, `${k}_url`))
+        );
+        if (missingFrames.length > 0) {
+          await failChain(
+            chain,
+            `verify incomplete: missing frame uploads (${missingFrames.join(", ")})`
+          );
           return chain;
         }
         chain.stage = "submit";
@@ -368,6 +400,40 @@ async function enqueueRenderStage(
 }
 
 /**
+ * Build the Instagram caption for the post stage.
+ * - Exact caption_template from the brief wins when present.
+ * - Otherwise compose from the brief's own parts: first title template (or
+ *   campaign name) + required @mentions + required #hashtags. This is only
+ *   reached when the brief does NOT demand an exact caption (the extractor
+ *   fail-closes on that), so composing is compliant.
+ */
+function buildCaption(
+  parsed: {
+    requirements?: {
+      caption_template?: string | null;
+      required_mentions?: string[];
+      required_hashtags?: string[];
+    };
+    title_templates?: string[];
+  },
+  campaignName: string
+): string {
+  const req = parsed.requirements ?? {};
+  if (req.caption_template && req.caption_template.trim().length >= 4) {
+    return req.caption_template.trim();
+  }
+  const lines: string[] = [];
+  const title = (parsed.title_templates ?? [])[0]?.trim() || campaignName;
+  if (title) lines.push(title);
+  const tags = [
+    ...(req.required_mentions ?? []),
+    ...(req.required_hashtags ?? []),
+  ].filter((t, i, a) => t && a.indexOf(t) === i);
+  if (tags.length) lines.push(tags.join(" "));
+  return lines.join("\n").trim();
+}
+
+/**
  * Advance a chain after the VM worker reported a render result.
  * Called from POST /api/render/result. Only acts when the render id matches
  * the chain's current render stage.
@@ -392,11 +458,10 @@ export async function onRenderDone(
     return chain;
   }
   const parsed = JSON.parse(chain.requirements_json ?? "{}");
-  const caption =
-    (parsed.requirements as { caption_template?: string } | undefined)
-      ?.caption_template ?? "";
+  const campaign = await getCampaign(chain.campaign_id);
+  const caption = buildCaption(parsed, campaign?.name ?? chain.campaign_name);
   if (!caption) {
-    await failChain(chain, "render done but no caption template for post");
+    await failChain(chain, "render done but no caption could be built");
     return chain;
   }
   chain.stage = "post";

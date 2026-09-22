@@ -3,6 +3,7 @@ import {
   getSchedule,
   listDevices,
   markScheduleRun,
+  requeueStuckJobs,
   scheduleDue,
 } from "@/lib/store";
 import { enqueueRunStep, RunError } from "@/lib/run";
@@ -54,19 +55,38 @@ export async function GET(req: NextRequest) {
   }
 
   for (const d of devices) {
+    // Stuck-job recovery first: requeue jobs whose heartbeat died >10 min
+    // ago so a dead phone never blocks the pipeline.
+    try {
+      const stuck = await requeueStuckJobs(d.device_id);
+      for (const j of stuck) ran.push(`${d.device_id}:${j.id} (requeued stuck ${j.type})`);
+    } catch (e: unknown) {
+      errors.push({
+        device_id: d.device_id,
+        error: `stuck-recovery: ${e instanceof Error ? e.message : "unknown"}`,
+      });
+    }
     const schedule = await getSchedule(d.device_id);
     if (!scheduleDue(schedule)) {
       skipped.push(d.device_id);
       continue;
     }
     try {
-      const { job } = await enqueueRunStep(d.device_id, "check");
+      const { job, campaign, chain } = await enqueueRunStep(d.device_id, "full");
       await markScheduleRun(d.device_id);
-      ran.push(`${d.device_id}:${job.id}`);
+      ran.push(
+        campaign
+          ? `${d.device_id}:${job.id} (chain ${chain?.id ?? "?"}, ${campaign.name})`
+          : `${d.device_id}:${job.id} (discovering campaigns)`
+      );
     } catch (e: unknown) {
       if (e instanceof RunError && e.status === 409) {
-        // e.g. no eligible campaign — not a hard failure, but don't mark run
-        skipped.push(`${d.device_id} (no eligible campaign)`);
+        // e.g. explicit campaign_id not found — not a hard failure
+        skipped.push(`${d.device_id} (${e.message})`);
+      } else if (e instanceof Error && /already (active|submitted)/i.test(e.message)) {
+        // startChain fail-closed: a chain is already running or this
+        // campaign was submitted — correct to skip, not an error.
+        skipped.push(`${d.device_id} (${e.message})`);
       } else {
         errors.push({
           device_id: d.device_id,

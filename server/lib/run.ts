@@ -24,6 +24,10 @@ import {
   verifyReelJob,
   whopSubmitJob,
 } from "./jobs";
+import { startChain, type Chain } from "./chain";
+
+/** Default Whop Content Rewards discovery page (overridable per run). */
+export const DEFAULT_DISCOVER_URL = "https://whop.com/content-rewards";
 
 export interface RunStepOptions {
   campaign_id?: string;
@@ -54,13 +58,18 @@ export class RunError extends Error {
  *  - post     -> ig_post (needs caption + video_url; payload.video_url is read by the phone)
  *  - verify   -> ig_verify (needs ig_post_url; DOM-level live check)
  *  - submit   -> whop_submit (needs campaign_id + ig_post_url)
- *  - full     -> check now; dashboard chains the rest off job results
+ *  - full     -> startChain(): check now, server auto-advances the rest
+ *                off job completions (chain engine).
+ *
+ * When no eligible campaign exists and no campaign_id was given, a discover
+ * job is enqueued automatically instead of failing — the pipeline refills
+ * its own campaign list. Returns campaign=null in that case.
  */
 export async function enqueueRunStep(
   device_id: string,
   step: string,
   opts: RunStepOptions = {}
-): Promise<{ job: Job; campaign: Campaign }> {
+): Promise<{ job: Job; campaign: Campaign | null; chain?: Chain }> {
   if (!device_id) throw new RunError(400, "device_id required");
 
   let campaign: Campaign | null = null;
@@ -69,12 +78,6 @@ export async function enqueueRunStep(
     if (!campaign) throw new RunError(404, "campaign not found");
   } else {
     campaign = await selectCampaign(device_id);
-    if (!campaign) {
-      throw new RunError(
-        409,
-        "no eligible campaign (inactive / no budget / already submitted)"
-      );
-    }
   }
 
   const now = new Date().toISOString();
@@ -94,6 +97,25 @@ export async function enqueueRunStep(
     created_at: now,
     updated_at: now,
   });
+
+  // No eligible campaign: auto-discover instead of 409. The phone scrapes
+  // the rewards page; /api/campaigns/discover ingests the cards; the next
+  // tick then has campaigns to chain.
+  if (!campaign && !opts.campaign_id) {
+    const discoverUrl =
+      typeof opts.discover_url === "string" && /^https?:\/\//i.test(opts.discover_url)
+        ? opts.discover_url
+        : DEFAULT_DISCOVER_URL;
+    const job = mkJob("whop_discover", discoverCampaignsJob(discoverUrl));
+    await enqueueJob(job);
+    return { job, campaign: null };
+  }
+  if (!campaign) {
+    throw new RunError(
+      409,
+      "no eligible campaign (inactive / no budget / already submitted)"
+    );
+  }
 
   let job: Job;
   switch (step) {
@@ -192,10 +214,15 @@ export async function enqueueRunStep(
       break;
     }
     case "full":
-    default:
-      // full = start with the check; dashboard chains the rest off job results
-      job = mkJob("whop_check_join", checkJoinJob(campaign));
-      break;
+    default: {
+      // full = startChain(): enqueues the check job AND registers the chain,
+      // so job completions auto-advance check->join->render->post->verify->submit.
+      // startChain throws on already-active/already-submitted (fail-closed).
+      const chain = await startChain(device_id, campaign);
+      const checkJob = await getJob(chain.job_id ?? "");
+      if (!checkJob) throw new RunError(500, "chain started but check job missing");
+      return { job: checkJob, campaign, chain };
+    }
   }
 
   await enqueueJob(job);

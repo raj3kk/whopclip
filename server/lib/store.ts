@@ -72,6 +72,12 @@ export interface Job {
   result: unknown;
   created_at: string;
   updated_at: string;
+  /** live progress: last step index/name the phone reported */
+  current_step?: string | null;
+  /** last heartbeat ISO time (phone pings during long jobs) */
+  last_heartbeat?: string | null;
+  /** heartbeat count (stuck-job detection) */
+  heartbeat_count?: number;
 }
 
 export interface Submission {
@@ -317,6 +323,47 @@ export async function finishJob(
   job.updated_at = new Date().toISOString();
   await kv.set(`job:${id}`, job);
   return job;
+}
+
+/**
+ * Live heartbeat: the phone pings this during long-running jobs with its
+ * current step. Used for stuck-job detection and the dashboard's live view.
+ * Only updates running jobs; never resurrects finished ones.
+ */
+export async function heartbeatJob(
+  id: string,
+  current_step: string
+): Promise<Job | null> {
+  const job = await getJob(id);
+  if (!job || job.status !== "running") return null;
+  job.current_step = current_step;
+  job.last_heartbeat = new Date().toISOString();
+  job.heartbeat_count = (job.heartbeat_count ?? 0) + 1;
+  job.updated_at = job.last_heartbeat;
+  await kv.set(`job:${id}`, job);
+  return job;
+}
+
+/**
+ * Stuck-job recovery: find jobs stuck in "running" with no heartbeat for
+ * longer than the threshold, and requeue them. Returns the requeued jobs.
+ * Called by the schedule tick so dead phones don't block the pipeline.
+ */
+export async function requeueStuckJobs(
+  device_id: string,
+  staleAfterMs = 10 * 60 * 1000
+): Promise<Job[]> {
+  const jobs = await listJobs(device_id);
+  const now = Date.now();
+  const requeued: Job[] = [];
+  for (const job of jobs) {
+    if (job.status !== "running") continue;
+    const last = job.last_heartbeat ?? job.updated_at;
+    if (now - new Date(last).getTime() < staleAfterMs) continue;
+    const r = await requeueJob(job.id);
+    if (r) requeued.push(r);
+  }
+  return requeued;
 }
 
 export async function listJobs(device_id: string): Promise<Job[]> {
