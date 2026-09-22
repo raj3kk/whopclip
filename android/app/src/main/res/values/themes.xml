@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.WhopClip" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <item name="colorPrimary">#6C3CE0</item>
+        <item name="colorPrimaryDark">#4E2AA8</item>
+        <item name="colorAccent">#9D7BFF</item>
+    </style>
+</resources>
