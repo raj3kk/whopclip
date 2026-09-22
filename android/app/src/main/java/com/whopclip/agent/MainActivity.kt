@@ -23,6 +23,7 @@ import java.net.URL
 class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
+    private lateinit var versionText: TextView
     private lateinit var serverInput: EditText
     private lateinit var pairInput: EditText
 
@@ -35,6 +36,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         statusText = findViewById(R.id.statusText)
+        versionText = findViewById(R.id.versionText)
         serverInput = findViewById(R.id.serverInput)
         pairInput = findViewById(R.id.pairInput)
         val whopBtn: Button = findViewById(R.id.whopLoginBtn)
@@ -120,8 +122,17 @@ class MainActivity : AppCompatActivity() {
         val whop = if (SessionManager.isWhopLinked(this)) "✓ linked" else "✗ not linked"
         val ig = if (SessionManager.isIgLinked(this)) "✓ linked" else "✗ not linked"
         val paired = if (SessionManager.isPaired(this)) "✓ paired" else "✗ not paired"
-        statusText.text = "Whop: $whop\nInstagram: $ig\nPairing: $paired\nDevice: ${SessionManager.deviceId(this).take(8)}…"
+        val wmErr = WhopClipApp.workInitError
+        val wm = if (wmErr == null) "✓ ok" else "✗ $wmErr"
+        statusText.text = "Whop: $whop\nInstagram: $ig\nPairing: $paired\nWorkManager: $wm\nDevice: ${SessionManager.deviceId(this).take(8)}…"
+        versionText.text = "v${appVersionName()} (${SessionManager.appVersionCode(this)})"
     }
+
+    @Suppress("DEPRECATION")
+    private fun appVersionName(): String = try {
+        val pi = packageManager.getPackageInfo(packageName, 0)
+        pi.versionName ?: "?"
+    } catch (_: Exception) { "?" }
 
     /** Checkpoint 10 — server flagged a session expired -> prompt re-login. */
     private fun checkStaleSessions() {

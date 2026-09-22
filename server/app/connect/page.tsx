@@ -4,7 +4,7 @@ import PairBox from "./pair-box";
 
 export default function ConnectPage() {
   if (!isAuthed()) redirect("/login");
-  const apkUrl = "/whopclip-v4.apk";
+  const apkUrl = "/whopclip-v5.apk";
   return (
     <div className="wrap" style={{ maxWidth: 720 }}>
       <h1 style={{ marginTop: 28 }}>📱 App connect karo</h1>
