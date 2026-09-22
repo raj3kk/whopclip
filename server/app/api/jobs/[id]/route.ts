@@ -12,6 +12,7 @@ import {
   type ServiceName,
 } from "@/lib/store";
 import { verifyAuthToken, AUTH_COOKIE } from "@/lib/auth";
+import { onJobDone, onJobFailed } from "@/lib/chain";
 import crypto from "crypto";
 
 /**
@@ -110,6 +111,21 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
           created_at: now,
         });
       }
+    }
+
+    // Chain engine: advance the campaign pipeline when a staged job finishes.
+    // Runs after submission recording so the chain sees the final state.
+    // Failures inside the chain engine must never break job reporting.
+    try {
+      if (status === "done") {
+        await onJobDone(job);
+      } else {
+        const err =
+          typeof r.error === "string" ? r.error : "job failed (no error detail)";
+        await onJobFailed(job, err);
+      }
+    } catch (e: unknown) {
+      console.error("[chain] advance error:", e instanceof Error ? e.message : e);
     }
 
     return NextResponse.json({ ok: true, job });

@@ -72,7 +72,9 @@ object SessionManager {
     suspend fun pairDevice(ctx: Context, code: String): Boolean =
         withContext(Dispatchers.IO) {
             try {
-                val clean = code.trim().uppercase().replace(" ", "")
+                // Normalize: uppercase, drop dashes/spaces — "abcd-1234",
+                // "abcd1234" and "abcd 1234" must all work.
+                val clean = code.trim().uppercase().replace(Regex("[^A-Z0-9]"), "")
                 if (clean.isEmpty()) return@withContext false
                 val body = JSONObject().apply {
                     put("action", "claim")
@@ -89,20 +91,39 @@ object SessionManager {
                     doOutput = true
                 }
                 OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
-                val ok = conn.responseCode in 200..299
+                val httpCode = conn.responseCode
+                // Surface the server's real error (expired vs invalid vs network)
+                // so failures are diagnosable instead of a generic toast.
+                val errBody = try {
+                    (if (httpCode in 200..299) conn.inputStream else conn.errorStream)
+                        ?.bufferedReader()?.readText()?.take(200) ?: ""
+                } catch (_: Exception) { "" }
                 conn.disconnect()
+                val ok = httpCode in 200..299
                 if (ok) {
                     prefs(ctx).edit().putBoolean(KEY_PAIRED, true).apply()
                     Log.i(TAG, "device paired with code $clean")
                 } else {
-                    Log.w(TAG, "pair failed: HTTP ${conn.responseCode}")
+                    Log.w(TAG, "pair failed: HTTP $httpCode body=$errBody")
+                    lastPairError = if (httpCode == 404) {
+                        val expired = errBody.contains("expir", ignoreCase = true)
+                        if (expired) "Code expire ho gaya — website se naya code banao"
+                        else "Galat code — website /connect wala code exactly dalo"
+                    } else {
+                        "Server error ($httpCode) — net check karke dobara try karo"
+                    }
                 }
                 ok
             } catch (e: Exception) {
                 Log.e(TAG, "pairDevice failed", e)
+                lastPairError = "Network fail — server tak pahunch nahi paya"
                 false
             }
         }
+
+    /** Last human-readable pairing failure, shown in the UI toast. */
+    @Volatile
+    var lastPairError: String = ""
 
     /**
      * Pull cookies for [url] out of the WebView cookie store and POST them

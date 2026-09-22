@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { finishRender, getRender } from "@/lib/render";
+import { onRenderDone } from "@/lib/chain";
 
 /**
  * POST /api/render/result { id, ok, video_url?, error? }
@@ -45,6 +46,17 @@ export async function POST(req: NextRequest) {
       typeof video_url === "string" ? video_url : undefined,
       typeof error === "string" ? error : undefined
     );
+    // Chain engine: a finished render advances the campaign pipeline
+    // (render -> post). Never break the worker's result reporting.
+    try {
+      await onRenderDone(
+        String(id),
+        ok,
+        typeof video_url === "string" ? video_url : undefined
+      );
+    } catch (e: unknown) {
+      console.error("[chain] render advance error:", e instanceof Error ? e.message : e);
+    }
     return NextResponse.json({ ok: true, spec });
   } catch (e: unknown) {
     return NextResponse.json(

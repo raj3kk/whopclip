@@ -388,7 +388,16 @@ export function generatePairCode(): string {
   return `${s.slice(0, 4)}-${s.slice(4)}`;
 }
 
-export async function createPairCode(ttlMinutes = 10): Promise<PairCode> {
+/**
+ * Normalizes a user-typed pair code: uppercase, strip dashes/spaces/other
+ * separators. Phones often drop the dash when typing; lookup must not fail
+ * for that. "abcd-1234", "abcd1234", "abcd 1234" all -> "ABCD1234".
+ */
+export function normalizePairCode(code: string): string {
+  return code.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+export async function createPairCode(ttlMinutes = 30): Promise<PairCode> {
   const now = new Date();
   const p: PairCode = {
     code: generatePairCode(),
@@ -397,13 +406,23 @@ export async function createPairCode(ttlMinutes = 10): Promise<PairCode> {
     claimed_by: null,
     claimed_at: null,
   };
-  await kv.set(`pair:${p.code}`, p);
+  // Store under the normalized (dashless) key so typed-with/without-dash
+  // lookups both hit. Displayed code keeps the XXXX-XXXX form.
+  await kv.set(`pair:${normalizePairCode(p.code)}`, p);
   return p;
 }
 
 export async function getPairCode(code: string): Promise<PairCode | null> {
-  const v = await kv.get(`pair:${code.toUpperCase()}`);
-  return (v as PairCode) ?? null;
+  const norm = normalizePairCode(code);
+  if (!norm) return null;
+  // New codes are stored dashless; old ones as XXXX-XXXX — try both.
+  const tries = [`pair:${norm}`];
+  if (norm.length === 8) tries.push(`pair:${norm.slice(0, 4)}-${norm.slice(4)}`);
+  for (const k of tries) {
+    const v = await kv.get(k);
+    if (v) return v as PairCode;
+  }
+  return null;
 }
 
 export async function claimPairCode(
@@ -416,7 +435,9 @@ export async function claimPairCode(
   if (new Date(p.expires_at).getTime() < Date.now()) return null;
   p.claimed_by = device_id;
   p.claimed_at = new Date().toISOString();
-  await kv.set(`pair:${p.code}`, p);
+  // Re-store under the normalized key so the claim sticks regardless of
+  // which key form the code was found under.
+  await kv.set(`pair:${normalizePairCode(p.code)}`, p);
   return p;
 }
 

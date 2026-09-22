@@ -47,4 +47,4 @@ export function checkPassword(candidate: string): boolean {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// env-rotation: force fresh production build
+// env-rotation: force fresh build

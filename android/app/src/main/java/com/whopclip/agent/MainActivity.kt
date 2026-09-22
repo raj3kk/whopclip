@@ -105,9 +105,9 @@ class MainActivity : Activity() {
                         Toast.LENGTH_SHORT).show()
                     refreshStatus()
                 } else {
-                    Toast.makeText(this@MainActivity,
-                        "Pair nahi hua — code check karo (10 min expiry)",
-                        Toast.LENGTH_LONG).show()
+                    val why = SessionManager.lastPairError
+                        .ifBlank { "Pair nahi hua — code check karo (30 min expiry)" }
+                    Toast.makeText(this@MainActivity, why, Toast.LENGTH_LONG).show()
                 }
             }
         }

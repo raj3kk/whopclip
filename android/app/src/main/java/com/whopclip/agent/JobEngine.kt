@@ -114,6 +114,103 @@ class JobEngine(private val ctx: Context) {
         }
     }
 
+    /**
+     * Captures the WebView's current visible content as a PNG in the app
+     * cache (frames/). Returns the absolute file path. Must be called off
+     * the main thread; the bitmap capture itself hops to the UI thread.
+     */
+    private suspend fun captureScreenshot(wv: WebView, key: String): String =
+        withContext(Dispatchers.IO) {
+            val safeName = key.replace(Regex("[^A-Za-z0-9._-]"), "_")
+            val dir = File(ctx.cacheDir, "frames").apply { mkdirs() }
+            val out = File(dir, safeName)
+            val bmp = suspendCancellableCoroutine<android.graphics.Bitmap> { cont ->
+                mainHandler.post {
+                    try {
+                        val b = android.graphics.Bitmap.createBitmap(
+                            wv.width.coerceAtLeast(1),
+                            wv.height.coerceAtLeast(1),
+                            android.graphics.Bitmap.Config.ARGB_8888
+                        )
+                        val canvas = android.graphics.Canvas(b)
+                        wv.draw(canvas)
+                        cont.resume(b)
+                    } catch (e: Exception) {
+                        cont.resume(
+                            android.graphics.Bitmap.createBitmap(
+                                1, 1, android.graphics.Bitmap.Config.ARGB_8888
+                            )
+                        )
+                        Log.w(TAG, "screenshot capture failed: ${e.message}")
+                    }
+                }
+            }
+            try {
+                FileOutputStream(out).use { fos ->
+                    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 90, fos)
+                }
+            } finally {
+                bmp.recycle()
+            }
+            Log.i(TAG, "screenshot saved: ${out.absolutePath} (${out.length()} bytes)")
+            out.absolutePath
+        }
+
+    /**
+     * Uploads a captured frame to POST /api/frames (device-authenticated via
+     * device_id + job id). Returns the server URL on success, null otherwise.
+     * Frame upload failure never fails the job by itself — the caller decides.
+     * NOTE: single output stream for the whole multipart body — reopening
+     * HttpURLConnection's stream mid-request breaks the upload.
+     */
+    private suspend fun uploadFrame(job: JSONObject, key: String, path: String): String? =
+        withContext(Dispatchers.IO) {
+            try {
+                val file = File(path)
+                if (!file.exists() || file.length() == 0L) return@withContext null
+                val boundary = "WhopClipFrame${System.currentTimeMillis()}"
+                val deviceId = SessionManager.deviceId(ctx)
+                val jobId = job.optString("id", "")
+                val url = "${SessionManager.serverUrl(ctx)}/api/frames"
+                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+                    connectTimeout = 30000
+                    readTimeout = 60000
+                    doOutput = true
+                }
+                val out = conn.outputStream.buffered()
+                fun field(name: String, value: String) {
+                    out.write("--$boundary\r\n".toByteArray())
+                    out.write("Content-Disposition: form-data; name=\"$name\"\r\n\r\n".toByteArray())
+                    out.write("$value\r\n".toByteArray())
+                }
+                field("device_id", deviceId)
+                field("job_id", jobId)
+                field("key", key)
+                out.write("--$boundary\r\n".toByteArray())
+                out.write("Content-Disposition: form-data; name=\"frame\"; filename=\"$key\"\r\n".toByteArray())
+                out.write("Content-Type: image/png\r\n\r\n".toByteArray())
+                file.inputStream().use { it.copyTo(out) }
+                out.write("\r\n--$boundary--\r\n".toByteArray())
+                out.flush()
+                out.close()
+                val code = conn.responseCode
+                val body = try {
+                    conn.inputStream.bufferedReader().readText()
+                } catch (_: Exception) { "" }
+                finally { conn.disconnect() }
+                if (code !in 200..299) {
+                    Log.w(TAG, "frame upload failed: HTTP $code")
+                    return@withContext null
+                }
+                JSONObject(body).optString("url", "").ifBlank { null }
+            } catch (e: Exception) {
+                Log.w(TAG, "frame upload error: ${e.message}")
+                null
+            }
+        }
+
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
     private fun makeWebView(): WebView {
         val wv = WebView(ctx)
@@ -280,6 +377,21 @@ class JobEngine(private val ctx: Context) {
                             val key = s.getString("key")
                             val r = evalJs(wv, s.getString("code"))
                             extracted.put(key, r.trim('"'))
+                        }
+                        "screenshot" -> {
+                            // Captures the WebView's visible bitmap (for frame-level
+                            // live-reel verification at 1s/7s/15s/25s). Saves to the
+                            // app cache and records the file path in `extracted`
+                            // under the step's "key" (default "frame_<i>.png").
+                            // Optionally uploads to the server when "upload" is true
+                            // (POST /api/frames, device-authenticated).
+                            val key = s.optString("key", "frame_$i.png")
+                            val path = captureScreenshot(wv, key)
+                            extracted.put(key, path)
+                            if (s.optBoolean("upload", false)) {
+                                val url = uploadFrame(job, key, path)
+                                if (url != null) extracted.put("${key}_url", url)
+                            }
                         }
                         "upload" -> {
                             // Headless PollWorker has no activity/file-picker: fail

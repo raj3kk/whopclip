@@ -27,7 +27,7 @@ export async function POST(req: NextRequest) {
       if (!verifyAuthToken(req.cookies.get(AUTH_COOKIE)?.value)) {
         return NextResponse.json({ error: "login required" }, { status: 401 });
       }
-      const p = await createPairCode(10);
+      const p = await createPairCode(30);
       return NextResponse.json({ code: p.code, expires_at: p.expires_at });
     }
 
