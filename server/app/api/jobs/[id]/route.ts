@@ -4,7 +4,6 @@ import {
   enqueueJob,
   finishJob,
   getCampaign,
-  listJobs,
   markSessionStale,
   recordSubmission,
   requeueJob,
@@ -23,7 +22,7 @@ import crypto from "crypto";
  *    (checkpoint 10)
  *    whop_submit done + result.campaign_id/ig_post_url -> records submission
  *    (checkpoints 1 + 9: duplicate prevention + earnings ledger)
- * GET  /api/jobs?device_id= -> list jobs for a device (monitor)
+ * GET  /api/jobs?device_id= -> see app/api/jobs/route.ts (list jobs for a device)
  */
 export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
   if (params.id === "enqueue") {
@@ -103,12 +102,4 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
   } catch (e: unknown) {
     return NextResponse.json({ error: e instanceof Error ? e.message : "unknown" }, { status: 500 });
   }
-}
-
-export async function GET(req: NextRequest) {
-  const device_id = req.nextUrl.searchParams.get("device_id");
-  if (!device_id) {
-    return NextResponse.json({ error: "device_id required" }, { status: 400 });
-  }
-  return NextResponse.json({ jobs: listJobs(device_id) });
 }
