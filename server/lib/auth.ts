@@ -46,3 +46,5 @@ export function checkPassword(candidate: string): boolean {
   const b = Buffer.from(pw);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+
+// env-rotation: force fresh production build
