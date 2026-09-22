@@ -28,10 +28,12 @@
 
         <activity
             android:name=".LoginActivity"
+            android:theme="@style/Theme.WhopClip.AppCompat"
             android:exported="false" />
 
         <activity
             android:name=".JobRunnerActivity"
+            android:theme="@style/Theme.WhopClip.AppCompat"
             android:exported="false" />
 
         <service

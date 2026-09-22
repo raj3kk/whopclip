@@ -7,4 +7,16 @@
         <item name="android:colorPrimaryDark">#4E2AA8</item>
         <item name="android:colorAccent">#9D7BFF</item>
     </style>
+
+    <!-- v6.1: LoginActivity/JobRunnerActivity abhi bhi AppCompatActivity hain
+         (JobRunnerActivity ko registerForActivityResult chahiye jo sirf
+         ComponentActivity/AppCompat me hai). AppCompat ko AppCompat theme
+         chahiye warna "You need to use a Theme.AppCompat theme" crash aata
+         hai — isliye in dono activities ko per-activity theme. Launch path
+         (MainActivity) ab bhi pure platform pe hai. -->
+    <style name="Theme.WhopClip.AppCompat" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="colorPrimary">#6C3CE0</item>
+        <item name="colorPrimaryDark">#4E2AA8</item>
+        <item name="colorAccent">#9D7BFF</item>
+    </style>
 </resources>
