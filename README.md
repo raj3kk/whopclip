@@ -1,75 +1,74 @@
-# WhopClip
+# WhopClip — automated Whop Content Rewards clipper (Android + control plane)
 
-Fresh automation for **Whop Content Rewards clipping** — earn by clipping influencer content.
+Production status: **live**. Server: https://whopclip.vercel.app (Vercel, `raj3kk/whopclip`, root `server/`).
+Android: `com.whopclip.agent`, release-signed APK (see below).
 
 > This is a brand-new project. It is NOT related to the deleted ClipFlow/AutoClip.
 
 ## How it works
 
-1. **One-time login (Android app):** user signs in to Whop and Instagram once, inside the app's WebViews. The app extracts session cookies and uploads them to the server (AES-256-GCM encrypted).
-2. **Campaign loop (server):** pick a Content Rewards campaign → join if not joined → read requirements.
-3. **Video (pipeline):** download the influencer asset → edit to 9:16 with captions per campaign requirements.
-4. **Post (phone):** server sends an `ig_post` job → phone's JobEngine executes the steps in a WebView → returns the Instagram post URL.
-5. **Submit (phone):** server sends a `whop_submit` job → phone submits the IG link to the campaign on Whop.
+1. User installs the APK, opens it, taps **Whop login** and **Instagram login**
+   (in-app WebViews, once). Cookies are extracted and POSTed to the server
+   AES-256-GCM encrypted (`SESSION_MASTER_KEY`).
+2. Server picks the best eligible campaign
+   (`POST /api/campaigns` → `select`: active + budget>0 + not already submitted;
+   prefers joined, then highest $/1k).
+3. Orchestrator enqueues jobs (`POST /api/jobs/enqueue`); the phone claims them
+   (`GET /api/jobs/next`, atomic CAS claim), runs the WebView steps, reports back.
+4. Video is rendered on the VM (`pipeline/render.py`: 1080×1920, safe-zone
+   captions burned with libass).
+5. Phone posts to Instagram (foreground `JobRunnerActivity` handles the system
+   file picker — a background WebView cannot), extracts + live-verifies the Reel
+   URL, then submits it to the same Whop campaign and verifies submitted/pending.
+6. Earnings ledger: `GET /api/earnings?device_id=...`.
 
-## Repo layout
+## Fail-closed rules (no silent wrong actions)
 
-```
-android/   Kotlin app (com.whopclip.agent)
-  app/src/main/java/com/whopclip/agent/
-    MainActivity.kt      - home: link status, server URL, start polling
-    LoginActivity.kt     - one-time Whop/Instagram login WebViews
-    SessionManager.kt    - cookie extraction + encrypted upload to server
-    JobEngine.kt         - executes JSON step specs in a WebView
-    PollWorker.kt        - WorkManager: claim job -> run -> report
-    PollService.kt       - foreground service + boot receiver
-server/    Next.js 14 control plane (deploy to Vercel)
-  app/api/sessions/route.ts   - POST phone sessions (encrypted at rest)
-  app/api/campaigns/route.ts  - GET campaign state per device
-  app/api/jobs/next/route.ts  - GET phone claims next job (204 = empty)
-  app/api/jobs/[id]/route.ts  - POST enqueue/report/list jobs
-  lib/crypto.ts  - AES-256-GCM session encryption
-  lib/store.ts   - in-memory store (replace with KV/Postgres for prod)
-pipeline/  video render stage (v1: dry-run stub, v2: real ffmpeg edits)
-```
+- No eligible campaign → job is never created; `select` returns `campaign:null`.
+- Upload without foreground activity → job requeued + user notified (never skipped).
+- Step text missing (`assert_text`) → job fails, nothing posted.
+- Session expired mid-job → server marks it stale; app prompts re-login.
+- Duplicate campaign submission → blocked server-side (`alreadySubmitted`).
+- Pipeline refuses non-authorized download sources (`--allow-domain` required).
 
-## Job step spec
+## Server env vars (Vercel)
 
-Jobs are JSON the phone executes. Supported actions:
+| Var | Purpose |
+|---|---|
+| `SESSION_MASTER_KEY` | 64-hex key for AES-256-GCM session encryption (set) |
+| `SUPABASE_SERVICE_ROLE_KEY` | durable state in `flipify_kv` (`whopclip:*` keys). **Not set yet** — without it the server uses ephemeral in-memory state (works, but jobs/sessions don't survive cold starts). Set via a secure capture flow, then redeploy. |
+| `SUPABASE_URL` | defaults to the project's Supabase host; override only if it moves |
 
-| action | fields | purpose |
-|---|---|---|
-| `goto` | `url` | navigate |
-| `wait` | `ms` | sleep |
-| `wait_text` | `text`, `timeout_ms` | wait for text on page |
-| `click_text` | `text`, `timeout_ms` | click button/link by exact text |
-| `type` | `selector`, `text` | type into an element |
-| `js` | `code` | run JS, returns JSON |
-| `extract` | `key`, `code` | save JS result under key |
+State is namespaced `whopclip:*` inside the existing `flipify_kv` table — no new
+tables, no SQL migrations.
 
-Example `ig_post` job: goto instagram.com → upload flow → caption via `type` → share via `click_text` → `extract` post_url from location. `whop_submit`: goto campaign page → paste link → submit → confirm.
+## Android build (release)
 
-## Setup
+Prereqs: JDK 17, Android SDK (platform-34, build-tools 34.0.0), Gradle 8.7.
 
-### Server
 ```bash
-cd server
-npm install
-# generate once, set as Vercel env var:
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"  # -> SESSION_MASTER_KEY
-npm run build
+export ANDROID_SDK_ROOT=$HOME/workspace/.android-sdk
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+gradle assembleRelease
+# → app/build/outputs/apk/release/app-release.apk
 ```
-Deploy the `server/` directory to Vercel.
 
-### Android app
-Open `android/` in Android Studio, set `SessionManager.DEFAULT_SERVER_URL` to your
-deployed server URL (or set it in-app), build release APK, install on the phone.
-Log in to Whop + Instagram once, then tap **Automation start karo**.
+Signing: `android/whopclip-release.keystore` + `android/keystore.properties`
+(both NOT in git; kept in the persistent workspace). `versionCode` is bumped
+per release in `android/app/build.gradle`.
 
-## Status
-- [x] v1 skeleton: app login + session upload, JobEngine, polling, server API
-- [ ] Server-side campaign discovery via stored Whop session
-- [ ] Real video pipeline (ffmpeg 9:16 + captions)
-- [ ] `upload` step file-chooser wiring in JobEngine (needs activity result)
-- [ ] Persistent store (KV/Postgres) instead of in-memory
-- [ ] End-to-end test: join → render → post → submit
+## API quick reference
+
+- `POST /api/sessions` — upload encrypted session
+- `GET /api/sessions/status?device_id=` — linked/stale per service
+- `GET/POST /api/campaigns` — list / select / upsert
+- `POST /api/jobs/enqueue`, `GET /api/jobs/next?device_id=`, `POST /api/jobs/:id` (done|failed|requeue), `GET /api/jobs?device_id=`
+- `GET /api/earnings?device_id=`
+- Job templates: `server/lib/jobs.ts` (`checkJoinJob`, `joinJob`, `igPostJob`, `whopSubmitJob`)
+
+## What still needs the user
+
+1. Install the APK on the phone, set Server URL to `https://whopclip.vercel.app`,
+   log into Whop + Instagram once in the app.
+2. A real campaign: orchestrator selects/creates it after sessions are linked.
+3. `SUPABASE_SERVICE_ROLE_KEY` on Vercel (one env var) for durable state.
