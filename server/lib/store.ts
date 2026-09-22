@@ -26,6 +26,7 @@ export interface Session {
   device_id: string;
   service: ServiceName;
   encrypted: string; // AES-256-GCM blob (JSON string)
+  account: string; // best-effort username/handle captured at save time ("" = unknown)
   user_agent: string;
   device_model: string;
   stale: boolean;
@@ -176,12 +177,17 @@ export async function markSessionStale(device_id: string, service: ServiceName):
 }
 
 export async function sessionStatus(device_id: string): Promise<
-  Record<ServiceName, { linked: boolean; stale: boolean }>
+  Record<ServiceName, { linked: boolean; stale: boolean; account: string; updated_at: string }>
 > {
-  const out = {} as Record<ServiceName, { linked: boolean; stale: boolean }>;
+  const out = {} as Record<ServiceName, { linked: boolean; stale: boolean; account: string; updated_at: string }>;
   for (const svc of ["whop", "instagram"] as ServiceName[]) {
     const s = await getSession(device_id, svc);
-    out[svc] = { linked: !!s, stale: s?.stale === true };
+    out[svc] = {
+      linked: !!s,
+      stale: s?.stale === true,
+      account: s?.account ?? "",
+      updated_at: s?.updated_at ?? "",
+    };
   }
   return out;
 }
