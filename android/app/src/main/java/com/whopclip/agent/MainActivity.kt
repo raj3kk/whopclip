@@ -30,6 +30,8 @@ class MainActivity : AppCompatActivity() {
         val igBtn: Button = findViewById(R.id.igLoginBtn)
         val saveBtn: Button = findViewById(R.id.saveServerBtn)
         val startBtn: Button = findViewById(R.id.startBtn)
+        val pairInput: EditText = findViewById(R.id.pairInput)
+        val pairBtn: Button = findViewById(R.id.pairBtn)
 
         serverInput.setText(SessionManager.serverUrl(this))
 
@@ -55,14 +57,42 @@ class MainActivity : AppCompatActivity() {
             PollService.start(this)
             Toast.makeText(this, "Automation polling start ✓", Toast.LENGTH_SHORT).show()
         }
+        pairBtn.setOnClickListener {
+            val code = pairInput.text.toString().trim()
+            if (code.isEmpty()) {
+                Toast.makeText(this, "Pairing code daalo (website /connect se)",
+                    Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            pairBtn.isEnabled = false
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                val ok = SessionManager.pairDevice(this@MainActivity, code)
+                pairBtn.isEnabled = true
+                if (ok) {
+                    pairInput.text.clear()
+                    Toast.makeText(this@MainActivity, "Phone pair ho gaya ✓",
+                        Toast.LENGTH_SHORT).show()
+                    refreshStatus()
+                } else {
+                    Toast.makeText(this@MainActivity,
+                        "Pair nahi hua — code check karo (10 min expiry)",
+                        Toast.LENGTH_LONG).show()
+                }
+            }
+        }
     }
 
     override fun onResume() {
         super.onResume()
+        refreshStatus()
+        checkStaleSessions()
+    }
+
+    private fun refreshStatus() {
         val whop = if (SessionManager.isWhopLinked(this)) "✓ linked" else "✗ not linked"
         val ig = if (SessionManager.isIgLinked(this)) "✓ linked" else "✗ not linked"
-        statusText.text = "Whop: $whop\nInstagram: $ig\nDevice: ${SessionManager.deviceId(this).take(8)}…"
-        checkStaleSessions()
+        val paired = if (SessionManager.isPaired(this)) "✓ paired" else "✗ not paired"
+        statusText.text = "Whop: $whop\nInstagram: $ig\nPairing: $paired\nDevice: ${SessionManager.deviceId(this).take(8)}…"
     }
 
     /** Checkpoint 10 — server flagged a session expired -> prompt re-login. */

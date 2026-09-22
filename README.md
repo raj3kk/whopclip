@@ -2,7 +2,7 @@
 
 Production status: **live**. Server: https://whopclip.vercel.app (Vercel, `raj3kk/whopclip`, root `server/`).
 Android: `com.whopclip.agent` v1.0.0 (versionCode 2), release-signed APK:
-**https://whopclip.vercel.app/whopclip-v2.apk**
+**https://whopclip.vercel.app/whopclip-v3.apk**
 
 > This is a brand-new project. It is NOT related to the deleted ClipFlow/AutoClip.
 

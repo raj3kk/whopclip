@@ -56,4 +56,19 @@
         android:layout_marginTop="24dp"
         android:text="Automation start karo" />
 
+    <EditText
+        android:id="@+id/pairInput"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:hint="Pairing code (website /connect se)"
+        android:inputType="textCapCharacters" />
+
+    <Button
+        android:id="@+id/pairBtn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Phone pair karo" />
+
 </LinearLayout>

@@ -12,8 +12,8 @@ BT="$SDK/build-tools/34.0.0"
 PLATFORM="$SDK/platforms/android-34/android.jar"
 KOTLINC="$HOME/workspace/.kotlin/kotlinc/bin/kotlinc"
 
-VERSION_CODE="${VERSION_CODE:-2}"
-VERSION_NAME="${VERSION_NAME:-1.0.0}"
+VERSION_CODE="${VERSION_CODE:-3}"
+VERSION_NAME="${VERSION_NAME:-1.0.1}"
 APP_ID="com.whopclip.agent"
 
 rm -rf "$OUT"
@@ -61,10 +61,34 @@ wc -l "$OUT/sources.txt"
 
 echo "== 5. d8 (dex) =="
 # Program inputs: our classes + every dependency jar/classes.jar.
-# kotlin-stdlib comes from the kotlinc dist (already baked into our classes).
-D8_INPUTS="$(echo "$CP" | tr ':' '\n' | grep -v "kotlin-stdlib" | tr '\n' ' ') $(find "$OUT/classes" -name '*.class' | tr '\n' ' ')"
+# kotlin-stdlib: deps/ copies are STALE (1.7.x, pre-Kotlin-1.9) and are
+# excluded to avoid duplicate/version-mismatch classes. The compiler's own
+# bundled stdlib (matches kotlinc) is dexed instead. WITHOUT this the APK
+# ships zero kotlin.* classes -> instant NoClassDefFoundError on launch
+# (WhopClipApp is Kotlin; process dies before any UI).
+KOTLIN_STDLIB="$HOME/workspace/.kotlin/kotlinc/lib/kotlin-stdlib.jar"
+if [ ! -f "$KOTLIN_STDLIB" ]; then
+  echo "FATAL: kotlin-stdlib.jar not found at $KOTLIN_STDLIB"; exit 1
+fi
+D8_INPUTS="$KOTLIN_STDLIB $(echo "$CP" | tr ':' '\n' | grep -v "kotlin-stdlib" | tr '\n' ' ') $(find "$OUT/classes" -name '*.class' | tr '\n' ' ')"
+echo "DEBUG: KOTLIN_STDLIB=$KOTLIN_STDLIB" >&2
+echo "DEBUG: D8_INPUTS starts with: $(echo "$D8_INPUTS" | cut -c1-200)" >&2
 "$BT/d8" --lib "$PLATFORM" --min-api 26 --output "$OUT/dex" $D8_INPUTS 2>&1 | tail -5
 ls "$OUT/dex"
+# Launch-crash guard: kotlin stdlib classes MUST be class definitions in dex.
+# NOTE: dexdump output goes to a temp file first — piping straight into
+# `grep -q` trips pipefail (SIGPIPE, exit 141) when grep closes the pipe early.
+echo "DEBUG: checking $OUT/dex/classes.dex with $BT/dexdump" >&2
+ls -la "$OUT/dex/" >&2
+"$BT/dexdump" "$OUT/dex/classes.dex" 2>/dev/null > "$OUT/dex/dump.txt" || {
+  echo "FATAL: dexdump failed on classes.dex"; exit 1
+}
+if ! grep -q "Class descriptor.*Lkotlin/jvm/internal/Intrinsics;'" "$OUT/dex/dump.txt"; then
+  echo "DEBUG: grep found no match; sample descriptors:" >&2
+  grep "Class descriptor" "$OUT/dex/dump.txt" | head -5 >&2
+  echo "FATAL: kotlin stdlib missing from dex — APK would crash on launch"; exit 1
+fi
+echo "dex verification OK: kotlin stdlib present ($(grep -c "Class descriptor" "$OUT/dex/dump.txt") class defs)"
 
 echo "== 6. merge dex + resources into APK =="
 cp "$OUT/base.apk" "$OUT/apk/unsigned.apk"

@@ -24,6 +24,7 @@ object SessionManager {
     private const val KEY_SERVER_URL = "server_url"
     private const val KEY_WHOP_DONE = "whop_done"
     private const val KEY_IG_DONE = "ig_done"
+    private const val KEY_PAIRED = "paired"
 
     // TODO: replace with the real deployed server URL (Vercel).
     private const val DEFAULT_SERVER_URL = "https://whopclip.vercel.app"
@@ -50,6 +51,46 @@ object SessionManager {
 
     fun isWhopLinked(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_WHOP_DONE, false)
     fun isIgLinked(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_IG_DONE, false)
+    fun isPaired(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_PAIRED, false)
+
+    /**
+     * Claims a website-generated pairing code (POST /api/pair action=claim).
+     * Links this phone to the owner's dashboard permanently.
+     */
+    suspend fun pairDevice(ctx: Context, code: String): Boolean =
+        withContext(Dispatchers.IO) {
+            try {
+                val clean = code.trim().uppercase().replace(" ", "")
+                if (clean.isEmpty()) return@withContext false
+                val body = JSONObject().apply {
+                    put("action", "claim")
+                    put("code", clean)
+                    put("device_id", deviceId(ctx))
+                    put("app_version", "3")
+                    put("device_model", "${Build.MANUFACTURER} ${Build.MODEL}")
+                }
+                val conn = (URL("${serverUrl(ctx)}/api/pair").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Content-Type", "application/json")
+                    connectTimeout = 20000
+                    readTimeout = 20000
+                    doOutput = true
+                }
+                OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
+                val ok = conn.responseCode in 200..299
+                conn.disconnect()
+                if (ok) {
+                    prefs(ctx).edit().putBoolean(KEY_PAIRED, true).apply()
+                    Log.i(TAG, "device paired with code $clean")
+                } else {
+                    Log.w(TAG, "pair failed: HTTP ${conn.responseCode}")
+                }
+                ok
+            } catch (e: Exception) {
+                Log.e(TAG, "pairDevice failed", e)
+                false
+            }
+        }
 
     /**
      * Pull cookies for [url] out of the WebView cookie store and POST them
