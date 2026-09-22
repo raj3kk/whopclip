@@ -111,6 +111,7 @@ class MemoryKV implements KVBackend {
 
 const mem = new MemoryKV();
 const kv: KVBackend = dbEnabled ? supabaseKV : mem;
+export { kv };
 if (!dbEnabled) {
   console.warn("[whopclip] SUPABASE_SERVICE_ROLE_KEY not set — using ephemeral in-memory store");
 }

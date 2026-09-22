@@ -9,17 +9,30 @@ import crypto from "crypto";
 import {
   enqueueJob,
   getCampaign,
+  getJob,
   selectCampaign,
   type Campaign,
   type Job,
 } from "./store";
-import { checkJoinJob, joinJob, igPostJob, whopSubmitJob } from "./jobs";
+import { extractRequirementsFromText } from "./requirements";
+import { buildRenderSpec, enqueueRender, getRender } from "./render";
+import {
+  checkJoinJob,
+  discoverCampaignsJob,
+  joinJob,
+  igPostJob,
+  verifyReelJob,
+  whopSubmitJob,
+} from "./jobs";
 
 export interface RunStepOptions {
   campaign_id?: string;
   caption?: string;
   video_url?: string;
   ig_post_url?: string;
+  discover_url?: string;
+  /** requirements_text from a completed check job (for the render step) */
+  brief_text?: string;
 }
 
 export class RunError extends Error {
@@ -31,12 +44,17 @@ export class RunError extends Error {
 }
 
 /**
- * Enqueue a real JobEngine step template for the phone:
- *  - check  -> whop_check_join (reads join state + requirements)
- *  - join   -> whop_join (only if not joined)
- *  - post   -> ig_post (needs caption + video_url; payload.video_url is read by the phone)
- *  - submit -> whop_submit (needs campaign_id + ig_post_url)
- *  - full   -> check now; dashboard chains the rest off job results
+ * Enqueue a real JobEngine step template for the phone (or the VM worker):
+ *  - discover -> whop_discover (scrapes campaign cards; needs discover_url)
+ *  - check    -> whop_check_join (reads join state + requirements)
+ *  - join     -> whop_join (only if not joined)
+ *  - render   -> VM worker renders the 9:16 clip (server-side, not the phone).
+ *                Needs a completed check job's requirements_text: pass
+ *                check_job_id, or pre-parsed requirements via campaign.
+ *  - post     -> ig_post (needs caption + video_url; payload.video_url is read by the phone)
+ *  - verify   -> ig_verify (needs ig_post_url; DOM-level live check)
+ *  - submit   -> whop_submit (needs campaign_id + ig_post_url)
+ *  - full     -> check now; dashboard chains the rest off job results
  */
 export async function enqueueRunStep(
   device_id: string,
@@ -79,6 +97,17 @@ export async function enqueueRunStep(
 
   let job: Job;
   switch (step) {
+    case "discover": {
+      const discoverUrl =
+        typeof opts.discover_url === "string" ? opts.discover_url : "";
+      if (!discoverUrl || !/^https?:\/\//i.test(discoverUrl)) {
+        throw new RunError(400, "discover_url required for discover step");
+      }
+      job = mkJob("whop_discover", discoverCampaignsJob(discoverUrl), {
+        campaign_id: campaign.id,
+      });
+      break;
+    }
     case "check":
       job = mkJob("whop_check_join", checkJoinJob(campaign));
       break;
@@ -88,6 +117,54 @@ export async function enqueueRunStep(
       }
       job = mkJob("whop_join", joinJob(campaign));
       break;
+    case "render": {
+      // Server-side: parse the brief text (from a completed check job's
+      // requirements_text) and enqueue a render spec for the VM worker.
+      // FAIL-CLOSED on incomplete requirements.
+      const text =
+        typeof opts.brief_text === "string" ? opts.brief_text : "";
+      if (text.length < 50) {
+        throw new RunError(
+          400,
+          "render needs brief_text (requirements_text from a completed check job)"
+        );
+      }
+      const extraction = extractRequirementsFromText(text);
+      if (!extraction.complete) {
+        throw new RunError(
+          422,
+          `render blocked: incomplete requirements (${extraction.missing.join("; ")})`
+        );
+      }
+      const spec = buildRenderSpec(device_id, campaign, extraction.requirements, {
+        authorized_sources: extraction.authorized_sources,
+        title_templates: extraction.title_templates,
+      });
+      await enqueueRender(spec);
+      // Return a marker job so the dashboard can track render state.
+      job = mkJob("render_clip", [], {
+        payload: { render_id: spec.id },
+        campaign_id: campaign.id,
+      });
+      // render_clip jobs are server-side; mark done immediately — the VM
+      // worker picks up the spec via /api/render/next.
+      job.status = "done";
+      job.result = { render_id: spec.id, status: "queued" };
+      break;
+    }
+    case "verify": {
+      const ig_post_url =
+        typeof opts.ig_post_url === "string" ? opts.ig_post_url : "";
+      if (!ig_post_url || !/^https?:\/\//i.test(ig_post_url)) {
+        throw new RunError(400, "ig_post_url required for verify step");
+      }
+      job = mkJob(
+        "ig_verify",
+        verifyReelJob(ig_post_url),
+        { payload: { ig_post_url }, campaign_id: campaign.id }
+      );
+      break;
+    }
     case "post": {
       const caption = typeof opts.caption === "string" ? opts.caption : "";
       const video_url = typeof opts.video_url === "string" ? opts.video_url : "";
