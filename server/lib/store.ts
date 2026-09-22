@@ -273,7 +273,8 @@ export async function claimJob(device_id: string): Promise<Job | null> {
   const ids = await getIdx(`queue:${device_id}`);
   for (const id of ids) {
     const row = await getWithTs(`job:${id}`);
-    const job = row?.value as Job | null;
+    if (!row) continue;
+    const job = row.value as Job | null;
     if (!job || job.status !== "queued") continue;
     const claimed: Job = {
       ...job,
