@@ -3,8 +3,10 @@ import { finishRender, getRender } from "@/lib/render";
 import { onRenderDone } from "@/lib/chain";
 
 /**
- * POST /api/render/result { id, ok, video_url?, error? }
+ * POST /api/render/result { id, ok, video_url?, cover_url?, error? }
  * VM worker reports a finished render. Auth: CRON_SECRET (x-cron-secret/Bearer).
+ * cover_url (real ffmpeg-extracted frame) is REQUIRED when ok=true — the post
+ * stage fails closed without it; no placeholder is ever generated.
  */
 export const dynamic = "force-dynamic";
 
@@ -23,7 +25,7 @@ export async function POST(req: NextRequest) {
   }
   try {
     const body = await req.json();
-    const { id, ok, video_url, error } = body ?? {};
+    const { id, ok, video_url, cover_url, error } = body ?? {};
     if (!id || typeof ok !== "boolean") {
       return NextResponse.json(
         { error: "id and ok required" },
@@ -40,10 +42,17 @@ export async function POST(req: NextRequest) {
         { status: 400 }
       );
     }
+    if (ok && !cover_url) {
+      return NextResponse.json(
+        { error: "cover_url required when ok=true (real frame, no placeholder)" },
+        { status: 400 }
+      );
+    }
     const spec = await finishRender(
       String(id),
       ok,
       typeof video_url === "string" ? video_url : undefined,
+      typeof cover_url === "string" ? cover_url : undefined,
       typeof error === "string" ? error : undefined
     );
     // Chain engine: a finished render advances the campaign pipeline
@@ -52,7 +61,8 @@ export async function POST(req: NextRequest) {
       await onRenderDone(
         String(id),
         ok,
-        typeof video_url === "string" ? video_url : undefined
+        typeof video_url === "string" ? video_url : undefined,
+        typeof cover_url === "string" ? cover_url : undefined
       );
     } catch (e: unknown) {
       console.error("[chain] render advance error:", e instanceof Error ? e.message : e);

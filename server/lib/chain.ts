@@ -39,11 +39,12 @@ import {
   kv,
   recordSubmission,
   upsertCampaign,
-  earningsSummary,
   type Campaign,
   type Job,
   type Submission,
 } from "./store";
+import { getPostSlots, MAX_POSTS_PER_DAY } from "./postslots";
+export { MAX_POSTS_PER_DAY };
 import { extractRequirementsFromText } from "./requirements";
 import { buildRenderSpec, enqueueRender, getRender } from "./render";
 import {
@@ -81,6 +82,8 @@ export interface Chain {
   ig_post_url: string | null;
   /** rendered video URL (render stage output) */
   video_url: string | null;
+  /** real cover frame URL from the render worker (render stage output) */
+  cover_url: string | null;
   /** built caption (render stage output) */
   caption: string | null;
   /** parsed requirements (from check stage) */
@@ -97,7 +100,6 @@ const chainIdxKey = (device_id: string, campaign_id: string) =>
   `chain_idx:${device_id}:${campaign_id}`;
 
 const MAX_STAGE_ATTEMPTS = 3;
-export const MAX_POSTS_PER_DAY = 4;
 
 async function getIdx(key: string): Promise<string[]> {
   const v = (await kv.get(key)) as unknown;
@@ -154,12 +156,9 @@ export async function listActiveChains(device_id: string): Promise<Chain[]> {
   return out;
 }
 
-/** How many submissions this device made today (UTC date). */
-export async function countSubmissionsToday(device_id: string): Promise<number> {
-  const { submissions } = await earningsSummary(device_id);
-  const today = new Date().toISOString().slice(0, 10);
-  return submissions.filter((s) => (s.created_at ?? "").slice(0, 10) === today)
-    .length;
+/** Read-only early check: posts published today (UTC) live in the slot ledger. */
+async function postsToday(device_id: string): Promise<number> {
+  return (await getPostSlots(device_id)).count;
 }
 
 function failChain(c: Chain, error: string): Promise<void> {
@@ -206,7 +205,7 @@ export async function startChain(
       `chain ${existing.id} already active at stage ${existing.stage}`
     );
   }
-  const todayCount = await countSubmissionsToday(device_id);
+  const todayCount = await postsToday(device_id);
   if (todayCount >= MAX_POSTS_PER_DAY) {
     throw new Error(
       `daily post limit reached (${todayCount}/${MAX_POSTS_PER_DAY}) — chain refused`
@@ -224,6 +223,7 @@ export async function startChain(
     render_id: null,
     ig_post_url: null,
     video_url: null,
+    cover_url: null,
     caption: null,
     requirements_json: null,
     attempts: 0,
@@ -232,6 +232,15 @@ export async function startChain(
     updated_at: now,
   };
   await saveChain(chain);
+  // Pre-create the per-chain upload lock row (unlocked) so the first pump's
+  // lock acquisition is a pure CAS. Non-fatal: the pump falls back to
+  // seed-on-acquire for legacy chains.
+  try {
+    const { seedUploadLock } = await import("./igpost");
+    await seedUploadLock(chain.id);
+  } catch {
+    /* non-fatal */
+  }
   await pumpChain(chain);
   return (await getChain(chain.id)) ?? chain;
 }
@@ -384,9 +393,25 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
     await failChain(chain, "post stage reached without a rendered video_url");
     return "failed";
   }
+  if (!chain.cover_url || !/^https?:\/\//i.test(chain.cover_url)) {
+    await failChain(chain, "post stage reached without a render-supplied cover_url (real frame required)");
+    return "failed";
+  }
   if (!chain.caption) {
     await failChain(chain, "post stage reached without a caption");
     return "failed";
+  }
+  // Early read-only slot check: refuse/park when today's cap is already
+  // reached. The authoritative atomic reservation happens inside the upload,
+  // immediately before configure (spacing is enforced there).
+  const slots = await getPostSlots(chain.device_id);
+  if (slots.count >= MAX_POSTS_PER_DAY) {
+    // Park WITHOUT consuming an attempt — the UTC date rolls over and a
+    // later pump resumes the chain.
+    chain.error = `daily post cap reached (${slots.count}/${MAX_POSTS_PER_DAY}) — parked until tomorrow (UTC)`;
+    chain.updated_at = new Date().toISOString();
+    await saveChain(chain);
+    return "advanced"; // stage unchanged -> pump loop parks
   }
   const { postReelToInstagram } = await import("./igpost");
   let res;
@@ -395,6 +420,7 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
       chain.device_id,
       chain.id,
       chain.video_url,
+      chain.cover_url,
       chain.caption
     );
   } catch (e: unknown) {
@@ -615,7 +641,8 @@ export async function pumpDeviceChains(device_id: string): Promise<Chain[]> {
 export async function onRenderDone(
   render_id: string,
   ok: boolean,
-  video_url?: string
+  video_url?: string,
+  cover_url?: string
 ): Promise<Chain | null> {
   const spec = await getRender(render_id);
   if (!spec) return null;
@@ -631,6 +658,10 @@ export async function onRenderDone(
     await failChain(chain, "render ok but no video_url");
     return chain;
   }
+  if (!cover_url || !/^https?:\/\//i.test(cover_url)) {
+    await failChain(chain, "render ok but no cover_url — the worker must supply a real cover frame");
+    return chain;
+  }
   const parsed = JSON.parse(chain.requirements_json ?? "{}");
   const campaign = await getCampaign(chain.campaign_id);
   const caption = buildCaption(parsed, campaign?.name ?? chain.campaign_name);
@@ -639,6 +670,7 @@ export async function onRenderDone(
     return chain;
   }
   chain.video_url = video_url;
+  chain.cover_url = cover_url;
   chain.caption = caption;
   chain.stage = "post";
   await saveChain(chain);

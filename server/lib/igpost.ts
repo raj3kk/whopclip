@@ -14,9 +14,19 @@
  * advances exactly one phase. State lives in KV under `igpost:<chain_id>`.
  *
  * Safety:
- *  - Duplicate-post protection: the KV record is the point of no return.
- *    `configure` (the only call that publishes) runs only when no record
- *    says `done`, and a 120s lock serializes concurrent pumps.
+ *  - Duplicate-post protection, three layers:
+ *    a) the KV record (`igpost:<chain_id>`) is the point of no return;
+ *       `configure` (the only call that publishes) runs only when no record
+ *       says `done`;
+ *    b) concurrent pumps are serialized by an ATOMIC per-chain lock
+ *       (`igpost-lock:<chain_id>`, CAS on updated_at — never check-then-set);
+ *    c) before EVERY configure retry after an ambiguous attempt, the
+ *       account's recent media is reconciled (duration + caption fingerprint)
+ *       and configure is skipped when the reel is already published.
+ *  - Daily post-slot reservation: max 4 posts/device/UTC-day with 3h
+ *    spacing, reserved atomically (CAS) immediately before configure.
+ *  - Cover is a REAL source frame supplied by the render worker
+ *    (cover_url); a missing/invalid cover fails closed — no placeholder.
  *  - Device fingerprint stability: `generateDevice()` runs ONCE per account;
  *    the serialized state is persisted (`igstate:<device_id>`) and restored
  *    on every pump. Never re-generate after restore.
@@ -26,8 +36,10 @@
  *  - Video is validated before upload: portrait, ~9:16, 3s..15min.
  */
 
+import crypto from "crypto";
 import { decryptSession } from "./crypto";
-import { getSession, markSessionStale, kv, sessionStatus } from "./store";
+import { getSession, markSessionStale, kv, sessionStatus, getWithTs, casKey } from "./store";
+import { tryReservePostSlot } from "./postslots";
 
 export type IgPostPhase = "new" | "uploading" | "transcoding" | "done";
 
@@ -55,7 +67,17 @@ interface PostRecord {
   duration?: number;
   post_url?: string;
   media_id?: string;
+  /** ambiguous configure attempts so far (bounded; see Phase C) */
+  configure_attempts?: number;
   updated_at: string;
+}
+
+/** Per-chain pump lock value. */
+interface UploadLock {
+  /** epoch ms until which the lock is held */
+  until: number;
+  /** random token of the holder — release only succeeds for the holder */
+  token: string;
 }
 
 const recKey = (chain_id: string) => `igpost:${chain_id}`;
@@ -64,6 +86,8 @@ const stateKey = (device_id: string) => `igstate:${device_id}`;
 const LOCK_TTL_MS = 120_000;
 const MAX_VIDEO_BYTES = 100 * 1024 * 1024;
 const SOFT_DEADLINE_MS = 8_500; // stay well inside Vercel's 10s
+/** Max configure attempts per chain before failing closed for human review. */
+const MAX_CONFIGURE_ATTEMPTS = 3;
 
 class SessionExpiredError extends Error {
   constructor(msg: string) {
@@ -237,14 +261,150 @@ async function downloadVideo(url: string, startedAt: number): Promise<Buffer> {
   }
 }
 
-/** Solid dark 720x1280 JPEG cover (no ffmpeg on Vercel; VM can supply a real frame later). */
-async function makeCoverJpeg(): Promise<Buffer> {
-  const sharp = (await import("sharp")).default;
-  return sharp({
-    create: { width: 720, height: 1280, channels: 3, background: { r: 8, g: 8, b: 12 } },
-  })
-    .jpeg({ quality: 85 })
-    .toBuffer();
+const MAX_COVER_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Download the render worker's real cover frame. FAILS CLOSED: a missing,
+ * unreachable, or non-image cover refuses the upload — no placeholder is
+ * ever generated (a placeholder would violate the 1s-hook visual check).
+ */
+async function downloadCover(url: string, startedAt: number): Promise<Buffer> {
+  if (!url || !/^https?:\/\//i.test(url)) {
+    throw new Error("no cover_url supplied by the render worker — refusing to post with a placeholder");
+  }
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok || !res.body) {
+      throw new RetryableError(`cover download failed: HTTP ${res.status}`);
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const reader = res.body.getReader();
+    for (;;) {
+      if (Date.now() - startedAt > SOFT_DEADLINE_MS) {
+        throw new RetryableError("cover download exceeded time budget");
+      }
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_COVER_BYTES) throw new Error("cover image too large (>5MB)");
+      chunks.push(Buffer.from(value));
+    }
+    const buf = Buffer.concat(chunks);
+    if (buf.length < 16) throw new Error("cover download returned empty body");
+    const isJpeg = buf[0] === 0xff && buf[1] === 0xd8;
+    const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+    if (!isJpeg && !isPng) {
+      throw new Error("cover_url did not return a JPEG/PNG image — refusing placeholder");
+    }
+    return buf;
+  } catch (e: any) {
+    if (e?.name === "AbortError") throw new RetryableError("cover download timed out");
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/**
+ * Pre-create the per-chain pump lock row (unlocked) so the first real
+ * acquisition is a pure CAS. Called once at chain start; safe to re-run.
+ */
+export async function seedUploadLock(chain_id: string): Promise<void> {
+  try {
+    const existing = await kv.get(lockKey(chain_id));
+    if (existing == null) {
+      await kv.set(lockKey(chain_id), { until: 0, token: "" } as UploadLock);
+    }
+  } catch {
+    /* non-fatal: first pump falls back to seed-on-acquire */
+  }
+}
+
+/**
+ * Atomically acquire the per-chain pump lock via CAS on updated_at.
+ * Returns the holder token when acquired, null when another pump holds it.
+ * NEVER proceeds on a lost race — the caller must report busy / park.
+ */
+async function acquireUploadLock(chain_id: string): Promise<string | null> {
+  const key = lockKey(chain_id);
+  const now = Date.now();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await getWithTs(key);
+    if (!row) {
+      // Legacy chain (created before lock seeding) — seed, then CAS.
+      await kv.set(key, { until: 0, token: "" } as UploadLock);
+      continue;
+    }
+    const v = row.value as Partial<UploadLock> | null;
+    const until = typeof v?.until === "number" ? v.until : 0;
+    if (until > now) return null; // held by another pump
+    const token = crypto.randomUUID();
+    const next: UploadLock = { until: now + LOCK_TTL_MS, token };
+    if (await casKey(key, next, row.updated_at)) return token;
+    return null; // lost the CAS race — fail closed as busy
+  }
+  return null;
+}
+
+/** Release the lock only if we still hold it (never release another's). */
+async function releaseUploadLock(chain_id: string, token: string): Promise<void> {
+  const key = lockKey(chain_id);
+  try {
+    const row = await getWithTs(key);
+    const v = row?.value as Partial<UploadLock> | null;
+    if (row && v?.token === token) {
+      await kv.set(key, { until: 0, token: "" } as UploadLock);
+    }
+  } catch {
+    /* non-fatal */
+  }
+}
+
+/** A reel we already published (found by reconciliation). */
+interface RecentMedia {
+  code: string;
+  id: string;
+}
+
+const RECONCILE_WINDOW_S = 30 * 60;
+
+/**
+ * Look for a reel THIS chain published but whose configure response was
+ * lost. Fingerprint = duration (±2s) + exact caption text, within the last
+ * 30 minutes. Reconciliation runs ONLY after an ambiguous configure attempt
+ * (never on the first configure), so it can never adopt a reel the user
+ * posted manually from the IG app.
+ *
+ * Throws on feed errors — the caller must treat "cannot check" as
+ * "must not configure" (fail closed), never as "nothing published".
+ */
+async function findOurRecentMedia(
+  ig: any,
+  durationS: number,
+  caption: string
+): Promise<RecentMedia | null> {
+  const user = await ig.account.currentUser();
+  const pk = user?.pk;
+  if (!pk) throw new Error("could not resolve account pk for reconcile");
+  const items = await ig.feed.user(pk).items();
+  const nowS = Date.now() / 1000;
+  const wantCap = caption.trim().replace(/\s+/g, " ");
+  for (const it of items ?? []) {
+    if (it?.media_type !== 2) continue; // video only
+    const taken = Number(it.taken_at ?? 0);
+    if (!taken || nowS - taken > RECONCILE_WINDOW_S) continue;
+    const d = Number(it.video_duration ?? 0);
+    if (!d || Math.abs(d - durationS) > 2) continue;
+    const gotCap = String(it.caption?.text ?? "").trim().replace(/\s+/g, " ");
+    if (!gotCap || gotCap !== wantCap) continue;
+    const code = String(it.code ?? "");
+    if (!code) continue;
+    return { code, id: String(it.id ?? "") };
+  }
+  return null;
 }
 
 function validateVideo(info: { duration: number; width: number; height: number }): void {
@@ -304,11 +464,15 @@ async function mapError(e: unknown, device_id: string, errors: Record<string, an
  * Advance the reel upload one phase. Idempotent per chain_id:
  *  - returns the existing post_url if this chain already posted,
  *  - resumes an in-flight upload instead of starting a second one.
+ *
+ * cover_url (a REAL source frame from the render worker) is REQUIRED —
+ * a missing/invalid cover fails closed; no placeholder is ever generated.
  */
 export async function postReelToInstagram(
   device_id: string,
   chain_id: string,
   video_url: string,
+  cover_url: string,
   caption: string
 ): Promise<IgPostResult> {
   const startedAt = Date.now();
@@ -320,18 +484,17 @@ export async function postReelToInstagram(
       return { ok: true, post_url: existing.post_url, media_id: existing.media_id, phase: "done" };
     }
 
-    // Serialize concurrent pumps (phone poll + dashboard pump).
-    const now = Date.now();
-    const lock = (await kv.get(lockKey(chain_id))) as { until: number } | null;
-    if (lock && typeof lock.until === "number" && lock.until > now) {
-      return { ok: false, phase: "busy", error: "another upload pump is running", retryable: true };
+    // Serialize concurrent pumps (phone poll + dashboard pump) with an
+    // ATOMIC lock — CAS on updated_at, never check-then-set.
+    const token = await acquireUploadLock(chain_id);
+    if (!token) {
+      return { ok: false, phase: "busy", error: "another upload pump holds the lock", retryable: true };
     }
-    await kv.set(lockKey(chain_id), { until: now + LOCK_TTL_MS });
 
     try {
-      return await runPhases(device_id, chain_id, video_url, caption, existing, startedAt);
+      return await runPhases(device_id, chain_id, video_url, cover_url, caption, existing, startedAt);
     } finally {
-      await kv.set(lockKey(chain_id), { until: 0 });
+      await releaseUploadLock(chain_id, token);
     }
   } catch (e: unknown) {
     return mapError(e, device_id, errors);
@@ -342,6 +505,7 @@ async function runPhases(
   device_id: string,
   chain_id: string,
   video_url: string,
+  cover_url: string,
   caption: string,
   existing: PostRecord | null,
   startedAt: number
@@ -376,7 +540,8 @@ async function runPhases(
         width: info.width,
         height: info.height,
       });
-      const cover = await makeCoverJpeg();
+      // Real source frame from the render worker — fail closed if missing.
+      const cover = await downloadCover(cover_url, startedAt);
       await ig.upload.photo({ file: cover, uploadId });
     } catch (e: any) {
       if (isInst(e, errors, "IgResponseError")) {
@@ -436,17 +601,77 @@ async function runPhases(
     await saveState();
     return { ok: true, phase: "transcoding" };
   }
+
+  const durationS = rec.duration / 1000;
+  const priorAttempts = rec.configure_attempts ?? 0;
+
+  // (2) Reconcile FIRST on any pump that follows an ambiguous attempt: if
+  // the earlier configure published but the response was lost, adopt the
+  // existing reel — NEVER re-configure into a duplicate post, and never
+  // burn another daily slot for a post that already exists.
+  if (priorAttempts > 0) {
+    let found: RecentMedia | null = null;
+    try {
+      found = await findOurRecentMedia(ig, durationS, caption);
+    } catch (e: any) {
+      // "Cannot check" is NOT "nothing published" — fail closed, retry later.
+      throw new RetryableError(
+        `reconcile check failed (${e?.message ?? "unknown"}) — refusing to configure blind`
+      );
+    }
+    if (found) {
+      const post_url = `https://www.instagram.com/reel/${found.code}/`;
+      rec = {
+        ...rec,
+        phase: "done",
+        post_url,
+        media_id: found.id,
+        updated_at: new Date().toISOString(),
+      };
+      await kv.set(recKey(chain_id), rec);
+      await saveState();
+      return { ok: true, post_url, media_id: found.id, phase: "done" };
+    }
+  }
+
+  if (priorAttempts >= MAX_CONFIGURE_ATTEMPTS) {
+    throw new Error(
+      `configure ambiguous after ${MAX_CONFIGURE_ATTEMPTS} attempts with no published media found — human review needed (no duplicate was posted)`
+    );
+  }
+
+  // (4) Atomic post-slot reservation immediately BEFORE configure — max
+  // 4/day + 3h spacing, CAS-guarded. This IS the increment, so no concurrent
+  // chain can slip between check and publish. A failed configure afterwards
+  // conservatively consumes the slot (safe direction: the cap can
+  // under-fill, never over-fill). It runs after reconciliation so a retry
+  // pump that finds an already-published reel never burns a slot.
+  const slot = await tryReservePostSlot(device_id);
+  if (!slot.ok) {
+    // Park without consuming a chain attempt; a later pump retries.
+    // Spacing self-heals after 3h; the cap self-heals at UTC midnight.
+    throw new RetryableError(`post slot unavailable: ${slot.reason}`);
+  }
+
+  const attemptNo = priorAttempts + 1;
   let res: any;
   try {
     res = await ig.media.configureVideo({
       upload_id: rec.upload_id,
       caption,
-      length: rec.duration / 1000,
+      length: durationS,
       width: rec.width,
       height: rec.height,
-      clips: [{ length: rec.duration / 1000, source_type: "4" }],
+      clips: [{ length: durationS, source_type: "4" }],
     });
   } catch (e: any) {
+    // Ambiguous: the publish may or may not have happened (lost response).
+    // Record the attempt and park — the NEXT pump reconciles before any
+    // retry, so a duplicate is never published blindly.
+    rec.configure_attempts = attemptNo;
+    rec.updated_at = new Date().toISOString();
+    await kv.set(recKey(chain_id), rec);
+    await saveState();
     if (isInst(e, errors, "IgResponseError")) {
       const wrapped = new Error(`configure failed: ${e.message}`);
       (wrapped as any).response = e.response;
@@ -458,10 +683,15 @@ async function runPhases(
   const code: string | undefined = res?.media?.code;
   const mediaId: string | undefined = res?.media?.id;
   if (!code) {
-    // Ambiguous: configure may or may not have published. Do NOT auto-retry
-    // blindly — surface for human review; the KV record has no post_url so a
-    // later manual pump would retry (flagged, not silent).
-    throw new Error("configure returned no media code — ambiguous, needs review");
+    // Ambiguous: configure may or may not have published. Record the
+    // attempt and park as retryable — the next pump reconciles first.
+    rec.configure_attempts = attemptNo;
+    rec.updated_at = new Date().toISOString();
+    await kv.set(recKey(chain_id), rec);
+    await saveState();
+    throw new RetryableError(
+      `configure returned no media code (attempt ${attemptNo}/${MAX_CONFIGURE_ATTEMPTS}) — recorded; next pump reconciles before any retry`
+    );
   }
   const post_url = `https://www.instagram.com/reel/${code}/`;
   rec = { ...rec, phase: "done", post_url, media_id: mediaId, updated_at: new Date().toISOString() };

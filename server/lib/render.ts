@@ -14,6 +14,13 @@ import { kv } from "./store";
  *        (hook >=10% from top, captions at/above 78%) -> uploads MP4 to
  *        Supabase storage -> POST /api/render/result { video_url }
  *   -> phone downloads video_url and posts to Instagram.
+ *
+ * WORKER COVER CONTRACT (fail-closed): the worker MUST also extract a REAL
+ * cover frame from the rendered video (ffmpeg, e.g. `-ss 1 -frames:v 1`,
+ * 720x1280 JPEG — a frame where the hook/title is visible), upload it as
+ * cover.jpg next to the MP4, and include its public URL as `cover_url` in
+ * the result. The post stage refuses to publish without a real cover —
+ * no placeholder is ever generated server-side.
  */
 
 export interface RenderSpec {
@@ -31,6 +38,8 @@ export interface RenderSpec {
   caption: string;
   status: "queued" | "claimed" | "done" | "failed";
   video_url: string | null;
+  /** real cover frame URL (ffmpeg-extracted source frame) — required when done */
+  cover_url: string | null;
   error: string | null;
   created_at: string;
   updated_at: string;
@@ -90,6 +99,7 @@ export function buildRenderSpec(
     caption,
     status: "queued",
     video_url: null,
+    cover_url: null,
     error: null,
     created_at: now,
     updated_at: now,
@@ -126,12 +136,14 @@ export async function finishRender(
   id: string,
   ok: boolean,
   video_url?: string,
+  cover_url?: string,
   error?: string
 ): Promise<RenderSpec | null> {
   const spec = await getRender(id);
   if (!spec) return null;
   spec.status = ok ? "done" : "failed";
   spec.video_url = video_url ?? null;
+  spec.cover_url = cover_url ?? null;
   spec.error = error ?? null;
   spec.updated_at = new Date().toISOString();
   await kv.set(renderKey(id), spec);

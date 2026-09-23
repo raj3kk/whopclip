@@ -15,7 +15,7 @@
  *   submissions:{device_id}         string[] (submission ids)
  */
 
-import { dbEnabled, supabaseKV, type KVBackend } from "./db";
+import { dbEnabled, nextVersion, supabaseKV, type KVBackend } from "./db";
 import crypto from "crypto";
 
 export type ServiceName = "whop" | "instagram";
@@ -104,12 +104,14 @@ class MemoryKV implements KVBackend {
     return this.m.get(key)?.value ?? null;
   }
   async set(key: string, value: unknown) {
-    this.m.set(key, { value, updated_at: new Date().toISOString() });
+    this.m.set(key, { value, updated_at: nextVersion() });
   }
   async cas(key: string, value: unknown, updatedAt: string) {
     const cur = this.m.get(key);
     if (!cur || cur.updated_at !== updatedAt) return false;
-    this.m.set(key, { value, updated_at: new Date().toISOString() });
+    // nextVersion() is unique per write (random microsecond digits), so a
+    // concurrent loser can never match again — even in the same millisecond.
+    this.m.set(key, { value, updated_at: nextVersion() });
     return true;
   }
   /** used only for atomic claim: fetch raw row with updated_at */
@@ -125,8 +127,9 @@ if (!dbEnabled) {
   console.warn("[whopclip] SUPABASE_SERVICE_ROLE_KEY not set — using ephemeral in-memory store");
 }
 
-/** Fetch a value plus its updated_at (for CAS). */
-async function getWithTs(key: string): Promise<{ value: unknown; updated_at: string } | null> {
+/** Fetch a value plus its updated_at (for CAS). Exported so other modules
+ *  can build atomic check-and-set operations on top of the same backend. */
+export async function getWithTs(key: string): Promise<{ value: unknown; updated_at: string } | null> {
   if (!dbEnabled) return mem.getRow(key);
   const full = `whopclip:${key}`;
   const base = process.env.SUPABASE_URL ?? "https://lqvijxfbneqdrjzeeinn.supabase.co";
@@ -139,6 +142,18 @@ async function getWithTs(key: string): Promise<{ value: unknown; updated_at: str
   const arr = (await res.json()) as Array<{ value: unknown; updated_at: string }>;
   if (!arr.length) return null;
   return { value: arr[0].value, updated_at: arr[0].updated_at };
+}
+
+/** Atomic compare-and-swap on updated_at: writes only if no other writer
+ *  changed the row since getWithTs. Returns true iff this writer won.
+ *  This is the primitive for all cross-pump mutual exclusion (upload
+ *  locks, post-slot reservation). */
+export async function casKey(
+  key: string,
+  value: unknown,
+  updatedAt: string
+): Promise<boolean> {
+  return dbEnabled ? supabaseKV.cas(key, value, updatedAt) : mem.cas(key, value, updatedAt);
 }
 
 async function getIdx(key: string): Promise<string[]> {

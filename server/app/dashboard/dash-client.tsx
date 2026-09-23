@@ -88,6 +88,7 @@ export default function Dashboard() {
   const [runStep, setRunStep] = useState<Record<string, string>>({});
   const [caption, setCaption] = useState<Record<string, string>>({});
   const [videoUrl, setVideoUrl] = useState<Record<string, string>>({});
+  const [coverUrl, setCoverUrl] = useState<Record<string, string>>({});
   const [live, setLive] = useState<LiveData | null>(null);
 
   const load = useCallback(async () => {
@@ -142,6 +143,7 @@ export default function Dashboard() {
     if (step === "post") {
       body.caption = caption[c.id] || c.requirements?.caption_template || "";
       body.video_url = videoUrl[c.id] || "";
+      body.cover_url = coverUrl[c.id] || "";
     }
     if (step === "submit") {
       const lastPost = jobs.find((j) => (j.type === "ig_post" || j.type === "server_post") && j.status === "done");
@@ -407,6 +409,8 @@ export default function Dashboard() {
                 <div style={{ marginTop: 10 }}>
                   <label>Video URL (server-rendered ya uploaded clip)</label>
                   <input value={videoUrl[c.id] || ""} onChange={(e) => setVideoUrl({ ...videoUrl, [c.id]: e.target.value })} placeholder="https://…" />
+                  <label>Cover URL (real frame — required, no placeholder)</label>
+                  <input value={coverUrl[c.id] || ""} onChange={(e) => setCoverUrl({ ...coverUrl, [c.id]: e.target.value })} placeholder="https://…/cover.jpg" />
                   <label>Caption (exact)</label>
                   <textarea rows={3} value={caption[c.id] ?? c.requirements?.caption_template ?? ""} onChange={(e) => setCaption({ ...caption, [c.id]: e.target.value })} />
                 </div>

@@ -17,6 +17,23 @@ export const dbEnabled = SB_URL.length > 0 && SB_KEY.length > 0;
 
 const DEVICE = "whopclip";
 
+/**
+ * Unique version token for CAS writes. ISO-8601 with random microsecond
+ * digits appended — unique per write even when two writers land in the same
+ * millisecond, so a conditional-PATCH compare-and-set can never double-win.
+ * (Plain `new Date().toISOString()` only has ms precision: two concurrent
+ * writers in the same ms would stamp the SAME version and both CAS calls
+ * would match.) Valid for timestamptz and text columns; still parses as a
+ * date wherever it is displayed.
+ */
+export function nextVersion(): string {
+  const iso = new Date().toISOString();
+  const micro = Math.floor(Math.random() * 1000)
+    .toString()
+    .padStart(3, "0");
+  return iso.replace(/(\.\d{3})Z$/, `$1${micro}Z`);
+}
+
 async function sb(
   method: "GET" | "POST" | "PATCH",
   path: string,
@@ -66,7 +83,7 @@ export const supabaseKV: KVBackend = {
 
   async set(key: string, value: unknown) {
     const full = `whopclip:${key}`;
-    const now = new Date().toISOString();
+    const now = nextVersion();
     const filter = `device_id=eq.${DEVICE}&key=eq.${encodeURIComponent(full)}`;
     // NOTE (2026-09-22): PostgREST upsert (?on_conflict=device_id,key) 409s
     // on this project's flipify_kv because there is no UNIQUE(device_id,key)
@@ -106,7 +123,7 @@ export const supabaseKV: KVBackend = {
     const full = `whopclip:${key}`;
     const payload = {
       value: value as Record<string, unknown>,
-      updated_at: new Date().toISOString(),
+      updated_at: nextVersion(),
     };
     const { status, json } = await sb(
       "PATCH",

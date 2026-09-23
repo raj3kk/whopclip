@@ -38,6 +38,8 @@ export interface RunStepOptions {
   campaign_id?: string;
   caption?: string;
   video_url?: string;
+  /** real cover frame URL — required for the post step */
+  cover_url?: string;
   ig_post_url?: string;
   discover_url?: string;
   /** requirements_text from a completed check job (for the render step) */
@@ -349,18 +351,22 @@ export async function enqueueRunStep(
       // session (lib/igpost). The phone never posts.
       const caption = typeof opts.caption === "string" ? opts.caption : "";
       const video_url = typeof opts.video_url === "string" ? opts.video_url : "";
+      const cover_url = typeof opts.cover_url === "string" ? opts.cover_url : "";
       if (!caption || !video_url) {
         throw new RunError(400, "caption and video_url required for post step");
+      }
+      if (!cover_url) {
+        throw new RunError(400, "cover_url required for post step (real frame — no placeholder)");
       }
       const { postReelToInstagram } = await import("./igpost");
       const { createHash } = await import("node:crypto");
       // Standalone run step has no chain — derive a deterministic idempotency
       // key so re-running the same video+caption resumes instead of re-posting.
       const idem = createHash("sha1")
-        .update(`${device_id}|${video_url}|${caption}`)
+        .update(`${device_id}|${video_url}|${cover_url}|${caption}`)
         .digest("hex")
         .slice(0, 16);
-      const res = await postReelToInstagram(device_id, `run-post:${idem}`, video_url, caption);
+      const res = await postReelToInstagram(device_id, `run-post:${idem}`, video_url, cover_url, caption);
       if (res.phase === "uploading" || res.phase === "transcoding" || res.phase === "busy") {
         throw new RunError(
           202,
