@@ -59,6 +59,8 @@ class JobEngine(private val ctx: Context) {
     private val TAG = "JobEngine"
 
     class JobFailed(msg: String) : Exception(msg)
+    /** Owner ne dashboard se cancel kiya — heartbeat ne cancel_requested dekha. */
+    class JobCancelled(msg: String) : Exception(msg)
 
     companion object {
         /** In-memory tracker of the currently running job, for the Live tab. */
@@ -246,7 +248,15 @@ class JobEngine(private val ctx: Context) {
                 "${job.optString("id", "").take(8)} — $stepDesc"
         )
         try {
-            postHeartbeat(job, stepDesc)
+            // Owner ne cancel kiya ho to turant ruko — ye exception run()
+            // ke finally se hote hue caller tak jaati hai jo "cancelled"
+            // report karta hai. Reporting kabhi job fail nahi karti.
+            if (postHeartbeat(job, stepDesc)) {
+                Log.i(TAG, "cancel requested by owner — aborting job")
+                throw JobCancelled("owner ne dashboard se cancel kiya")
+            }
+        } catch (e: JobCancelled) {
+            throw e
         } catch (e: Exception) {
             Log.w(TAG, "heartbeat failed: ${e.message}")
         }
@@ -257,11 +267,15 @@ class JobEngine(private val ctx: Context) {
         }
     }
 
-    private suspend fun postHeartbeat(job: JSONObject, step: String) =
+    /**
+     * Heartbeat bhejta hai; true lautaata hai jab server ne cancel_requested
+     * bheja ho (owner ne job cancel kiya).
+     */
+    private suspend fun postHeartbeat(job: JSONObject, step: String): Boolean =
         withContext(Dispatchers.IO) {
             val deviceId = SessionManager.deviceId(ctx)
             val jobId = job.optString("id", "")
-            if (jobId.isBlank()) return@withContext
+            if (jobId.isBlank()) return@withContext false
             val url = "${SessionManager.serverUrl(ctx)}/api/jobs/$jobId/heartbeat"
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
@@ -276,7 +290,15 @@ class JobEngine(private val ctx: Context) {
                     .put("current_step", step)
                     .toString()
                 conn.outputStream.use { it.write(body.toByteArray()) }
-                Log.i(TAG, "heartbeat -> $step (HTTP ${conn.responseCode})")
+                val code = conn.responseCode
+                Log.i(TAG, "heartbeat -> $step (HTTP $code)")
+                if (code !in 200..299) return@withContext false
+                val resp = try {
+                    JSONObject(conn.inputStream.bufferedReader().readText())
+                } catch (_: Exception) {
+                    JSONObject()
+                }
+                resp.optBoolean("cancel_requested", false)
             } finally {
                 conn.disconnect()
             }

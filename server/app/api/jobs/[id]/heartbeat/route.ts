@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDevice, heartbeatJob } from "@/lib/store";
+import { getDevice, getJob, heartbeatJob } from "@/lib/store";
 
 /**
  * POST /api/jobs/:id/heartbeat { device_id, current_step }
@@ -8,6 +8,10 @@ import { getDevice, heartbeatJob } from "@/lib/store";
  * step it's on (e.g. "goto whop_url", "extract join_state", "upload frame_7s").
  * The dashboard shows live progress; the schedule tick requeues jobs whose
  * heartbeat goes stale (>10 min) so a dead phone never blocks the pipeline.
+ *
+ * Security: ownership is verified BEFORE any mutation — a device can only
+ * heartbeat its own jobs. Response carries cancel_requested so the phone
+ * aborts promptly when the owner cancels a running job.
  *
  * Auth: device_id must match a registered device that owns the job.
  */
@@ -32,6 +36,17 @@ export async function POST(
     if (!device) {
       return NextResponse.json({ error: "unknown device" }, { status: 403 });
     }
+    // Ownership FIRST — never mutate before verifying the caller owns the job.
+    const existing = await getJob(params.id);
+    if (!existing || existing.status !== "running") {
+      return NextResponse.json(
+        { error: "job not found or not running" },
+        { status: 404 }
+      );
+    }
+    if (existing.device_id !== device_id) {
+      return NextResponse.json({ error: "job belongs to another device" }, { status: 403 });
+    }
     const job = await heartbeatJob(params.id, current_step);
     if (!job) {
       return NextResponse.json(
@@ -39,13 +54,11 @@ export async function POST(
         { status: 404 }
       );
     }
-    if (job.device_id !== device_id) {
-      return NextResponse.json({ error: "job belongs to another device" }, { status: 403 });
-    }
     return NextResponse.json({
       ok: true,
       current_step: job.current_step,
       heartbeat_count: job.heartbeat_count,
+      cancel_requested: job.cancel_requested === true,
     });
   } catch (e: unknown) {
     return NextResponse.json(

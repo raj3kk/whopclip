@@ -53,6 +53,12 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
             try {
                 val out = JobEngine(applicationContext).run(job)
                 reportJob(job.getString("id"), "done", out)
+            } catch (e: JobEngine.JobCancelled) {
+                Log.i(TAG, "job cancelled by owner")
+                reportJob(
+                    job.getString("id"), "cancelled",
+                    JSONObject().put("error", e.message ?: "cancelled by owner")
+                )
             } catch (e: JobEngine.JobFailed) {
                 if ((e.message ?: "").startsWith("needs_foreground")) {
                     requeueJob(job.getString("id"))
@@ -171,7 +177,11 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
     }
 
     private fun reportJob(id: String, status: String, result: JSONObject) {
-        api("/api/jobs/$id", "POST", JSONObject().put("status", status).put("result", result))
+        api(
+            "/api/jobs/$id", "POST",
+            JSONObject().put("status", status).put("result", result)
+                .put("device_id", SessionManager.deviceId(applicationContext))
+        )
     }
 
     private fun requeueJob(id: String) {

@@ -19,7 +19,7 @@ import { dbEnabled, supabaseKV, type KVBackend } from "./db";
 import crypto from "crypto";
 
 export type ServiceName = "whop" | "instagram";
-export type JobStatus = "queued" | "running" | "done" | "failed";
+export type JobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 export type SubmissionStatus = "submitted" | "pending" | "approved" | "rejected";
 
 export interface Session {
@@ -79,6 +79,8 @@ export interface Job {
   last_heartbeat?: string | null;
   /** heartbeat count (stuck-job detection) */
   heartbeat_count?: number;
+  /** owner asked to cancel a running job; the phone sees it on next heartbeat */
+  cancel_requested?: boolean;
 }
 
 export interface Submission {
@@ -285,6 +287,7 @@ export async function selectCampaign(device_id: string): Promise<Campaign | null
 export async function enqueueJob(job: Job): Promise<void> {
   await kv.set(`job:${job.id}`, job);
   await addToIdx(`queue:${job.device_id}`, job.id);
+  await logActivity(job.device_id, "job_enqueued", `Enqueued: ${job.type}`, job);
 }
 
 export async function getJob(id: string): Promise<Job | null> {
@@ -311,18 +314,23 @@ export async function claimJob(device_id: string): Promise<Job | null> {
     const ok = dbEnabled
       ? await supabaseKV.cas(`job:${id}`, claimed, row.updated_at)
       : await mem.cas(`job:${id}`, claimed, row.updated_at);
-    if (ok) return claimed;
+    if (ok) {
+      await logActivity(device_id, "job_claimed", `Phone ne uthaya: ${claimed.type}`, claimed);
+      return claimed;
+    }
     // lost the race — try next
   }
   return null;
 }
 
-export async function requeueJob(id: string): Promise<Job | null> {
+export async function requeueJob(id: string, reason?: string): Promise<Job | null> {
   const job = await getJob(id);
   if (!job) return null;
   job.status = "queued";
+  job.cancel_requested = false;
   job.updated_at = new Date().toISOString();
   await kv.set(`job:${id}`, job);
+  await logActivity(job.device_id, "job_requeued", reason ?? `Dobara queue me: ${job.type}`, job);
   return job;
 }
 
@@ -337,6 +345,41 @@ export async function finishJob(
   job.result = result;
   job.updated_at = new Date().toISOString();
   await kv.set(`job:${id}`, job);
+  const kind =
+    status === "done" ? "job_done" : status === "failed" ? "job_failed" : "job_cancelled";
+  const msg =
+    status === "done"
+      ? `Ho gaya ✓: ${job.type}`
+      : status === "failed"
+        ? `Fail ✗: ${job.type}`
+        : `Cancel: ${job.type}`;
+  await logActivity(job.device_id, kind, msg, job);
+  return job;
+}
+
+/**
+ * Owner-initiated cancel. Queued jobs are cancelled immediately; running
+ * jobs get cancel_requested=true and the phone aborts on its next heartbeat
+ * (fail-safe: a dead phone never blocks a cancel — requeue-stuck still works).
+ * Terminal jobs (done/failed/cancelled) are never touched.
+ */
+export async function cancelJob(id: string): Promise<Job | null> {
+  const job = await getJob(id);
+  if (!job) return null;
+  if (job.status === "done" || job.status === "failed" || job.status === "cancelled") {
+    return job;
+  }
+  if (job.status === "queued") {
+    job.status = "cancelled";
+    job.updated_at = new Date().toISOString();
+    await kv.set(`job:${id}`, job);
+    await logActivity(job.device_id, "job_cancelled", `Cancel (queued tha): ${job.type}`, job);
+  } else {
+    job.cancel_requested = true;
+    job.updated_at = new Date().toISOString();
+    await kv.set(`job:${id}`, job);
+    await logActivity(job.device_id, "job_cancel_requested", `Cancel bheja — phone agle heartbeat pe rokega: ${job.type}`, job);
+  }
   return job;
 }
 
@@ -375,7 +418,7 @@ export async function requeueStuckJobs(
     if (job.status !== "running") continue;
     const last = job.last_heartbeat ?? job.updated_at;
     if (now - new Date(last).getTime() < staleAfterMs) continue;
-    const r = await requeueJob(job.id);
+    const r = await requeueJob(job.id, `Stuck tha (heartbeat ${(Math.round((now - new Date(last).getTime()) / 60000))}m purana) — dobara queue: ${job.type}`);
     if (r) requeued.push(r);
   }
   return requeued;
@@ -643,6 +686,67 @@ export async function markScheduleRun(device_id: string): Promise<void> {
   const s = await getSchedule(device_id);
   s.last_run_date = new Date().toISOString().slice(0, 10);
   await setSchedule(s);
+}
+
+/* ---------------- activity timeline ---------------- */
+
+/**
+ * Durable per-device event timeline ("kya hua, kab hua"): every job
+ * lifecycle event is logged here so the dashboard Live tab can show a real
+ * activity feed under the live frame — not just the current job list.
+ * Capped at 200 events per device (zero-SQL KV, newest first on read).
+ */
+export interface ActivityEvent {
+  id: string;
+  device_id: string;
+  kind: string; // job_enqueued | job_claimed | job_done | job_failed | job_cancelled | job_cancel_requested | job_retried | job_requeued
+  message: string;
+  job_id?: string;
+  job_type?: string;
+  created_at: string;
+}
+
+const ACTIVITY_CAP = 200;
+
+export async function logActivity(
+  device_id: string,
+  kind: ActivityEvent["kind"],
+  message: string,
+  job?: { id: string; type: string } | null
+): Promise<void> {
+  if (!device_id) return;
+  try {
+    const ev: ActivityEvent = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      device_id,
+      kind,
+      message,
+      job_id: job?.id,
+      job_type: job?.type,
+      created_at: new Date().toISOString(),
+    };
+    await kv.set(`activity:${device_id}:${ev.id}`, ev);
+    const idxKey = `idx:activity:${device_id}`;
+    const ids = [...((await kv.get(idxKey)) as string[] | null ?? []), ev.id];
+    // cap: drop oldest
+    const trimmed = ids.slice(-ACTIVITY_CAP);
+    await kv.set(idxKey, trimmed);
+  } catch {
+    /* activity logging must never break job flow */
+  }
+}
+
+export async function listActivity(
+  device_id: string,
+  limit = 50
+): Promise<ActivityEvent[]> {
+  const ids = ((await kv.get(`idx:activity:${device_id}`)) as string[] | null) ?? [];
+  const out: ActivityEvent[] = [];
+  for (const id of ids.slice(-limit).reverse()) {
+    const ev = (await kv.get(`activity:${device_id}:${id}`)) as ActivityEvent | null;
+    if (ev) out.push(ev);
+  }
+  return out;
 }
 
 /* ---------------- live activity ---------------- */

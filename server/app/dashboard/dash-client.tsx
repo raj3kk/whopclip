@@ -21,13 +21,18 @@ type Job = {
   id: string; type: string; status: string; steps: unknown[];
   result: unknown; created_at: string; updated_at: string;
   current_step?: string | null; last_heartbeat?: string | null;
-  heartbeat_count?: number;
+  heartbeat_count?: number; cancel_requested?: boolean;
+};
+type ActivityEvent = {
+  id: string; kind: string; message: string;
+  job_id?: string; job_type?: string; created_at: string;
 };
 type LiveData = {
   live: {
     device_id: string; job_id: string; job_type: string;
     current_step: string; frame_url: string; updated_at: string;
   } | null;
+  activity: ActivityEvent[];
   running_job: {
     id: string; type: string; current_step: string | null;
     heartbeat_count: number; last_heartbeat: string | null;
@@ -174,18 +179,34 @@ export default function Dashboard() {
     else { alert(`Requeued: ${r.j.requeued?.length ?? 0} job(s)`); load(); }
   }
 
+  async function cancelJob(id: string, status: string) {
+    const msg = status === "running"
+      ? "Ye job abhi phone pe CHAL raha hai. Cancel bhejun? Phone agle heartbeat pe rokega."
+      : "Ye queued job cancel kar dun? Phone ise uthayega nahi.";
+    if (!confirm(msg)) return;
+    setBusy(id);
+    const r = await jpost(`/api/jobs/${id}/cancel`, {});
+    setBusy(null);
+    if (!r.ok) alert("Cancel failed: " + (r.j.error || r.status));
+    else load();
+  }
+
   function statusBadge(s: string) {
-    const cls = s === "done" ? "green" : s === "failed" ? "red" : s === "running" ? "blue" : "grey";
+    const cls = s === "done" ? "green" : s === "failed" ? "red" : s === "running" ? "blue" : s === "cancelled" ? "grey" : "grey";
     return <span className={`badge ${cls}`}>{s}</span>;
   }
 
   function jobRow(j: Job) {
+    const cancellable = j.status === "queued" || j.status === "running";
     return (
       <details className="job" key={j.id}>
         <summary>
           {statusBadge(j.status)}
           <b>{j.type}</b>
           <span className="muted">{j.steps.length} steps · {timeAgo(j.updated_at)}</span>
+          {j.cancel_requested && j.status === "running" && (
+            <span className="badge yellow">cancel requested ⏳</span>
+          )}
           {j.status === "failed" && (
             <button
               className="btn small green"
@@ -193,6 +214,15 @@ export default function Dashboard() {
               onClick={(e) => { e.preventDefault(); retryJob(j.id); }}
             >
               {busy === j.id ? "…" : "↻ Retry"}
+            </button>
+          )}
+          {cancellable && !j.cancel_requested && (
+            <button
+              className="btn small ghost"
+              disabled={busy === j.id}
+              onClick={(e) => { e.preventDefault(); cancelJob(j.id, j.status); }}
+            >
+              {busy === j.id ? "…" : "✕ Cancel"}
             </button>
           )}
         </summary>
@@ -384,6 +414,18 @@ export default function Dashboard() {
           <h3 style={{ marginTop: 18 }}>📜 History</h3>
           {sortedJobs.length === 0 && <div className="card muted">Abhi tak koi job history nahi.</div>}
           {sortedJobs.slice(0, 30).map(jobRow)}
+          <h3 style={{ marginTop: 18 }}>⚡ Activity</h3>
+          {(!live?.activity || live.activity.length === 0) && (
+            <div className="card muted">Abhi tak koi activity nahi — job events yahan dikhenge.</div>
+          )}
+          {(live?.activity ?? []).map((a) => (
+            <div className="card" key={a.id} style={{ padding: "10px 14px", marginBottom: 8 }}>
+              <div style={{ fontSize: 14 }}>{a.message}</div>
+              <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                {a.job_type ? `${a.job_type} · ` : ""}{timeAgo(a.created_at)}
+              </div>
+            </div>
+          ))}
         </>
       )}
 

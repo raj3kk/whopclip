@@ -18,6 +18,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -25,6 +26,9 @@ import android.widget.TextView
 import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -72,7 +76,9 @@ class MainActivity : Activity() {
     // Live tab
     private lateinit var liveStatusText: TextView
     private lateinit var liveJobText: TextView
+    private lateinit var liveFrameImg: ImageView
     private lateinit var liveHistoryText: TextView
+    private var livePoll: Job? = null
 
     // Profile tab
     private lateinit var profileConnText: TextView
@@ -152,7 +158,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         refreshProfile()
-        if (tabLive.visibility == View.VISIBLE) refreshLive()
+        if (tabLive.visibility == View.VISIBLE) { refreshLive(); startLivePoll() }
         // Permanent connect prompt until paired.
         if (!SessionManager.isPaired(this) && !connectDialogShown) {
             connectDialogShown = true
@@ -164,8 +170,13 @@ class MainActivity : Activity() {
         tabBrowser.visibility = if (idx == 0) View.VISIBLE else View.GONE
         tabLive.visibility = if (idx == 1) View.VISIBLE else View.GONE
         tabProfile.visibility = if (idx == 2) View.VISIBLE else View.GONE
-        if (idx == 1) refreshLive()
+        if (idx == 1) { refreshLive(); startLivePoll() } else { stopLivePoll() }
         if (idx == 2) refreshProfile()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        stopLivePoll()
     }
 
     // ================= BROWSER TAB =================
@@ -360,8 +371,80 @@ class MainActivity : Activity() {
     private fun setupLiveTab() {
         liveStatusText = findViewById(R.id.liveStatusText)
         liveJobText = findViewById(R.id.liveJobText)
+        liveFrameImg = findViewById(R.id.liveFrameImg)
         liveHistoryText = findViewById(R.id.liveHistoryText)
         findViewById<Button>(R.id.liveRefreshBtn).setOnClickListener { refreshLive() }
+    }
+
+    /**
+     * Live tab auto-refresh: jab tak Live tab khula hai, har 10s me server
+     * se latest live frame (phone ki screen ka screenshot) + running job
+     * ka step laata hai. Screenshot upar, history neeche — dashboard jaisa.
+     */
+    private fun startLivePoll() {
+        stopLivePoll()
+        livePoll = CoroutineScope(Dispatchers.Main).launch {
+            while (isActive) {
+                fetchLiveFrame()
+                delay(10000)
+            }
+        }
+    }
+
+    private fun stopLivePoll() {
+        livePoll?.cancel()
+        livePoll = null
+    }
+
+    private suspend fun fetchLiveFrame() {
+        val frameUrl: String
+        val runningStep: String?
+        val runningType: String?
+        try {
+            val deviceId = SessionManager.deviceId(this@MainActivity)
+            val url = "${SessionManager.serverUrl(this@MainActivity)}/api/devices/$deviceId/live"
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 15000
+                readTimeout = 15000
+            }
+            val code = conn.responseCode
+            val body = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+            if (code !in 200..299) return
+            val root = JSONObject(body)
+            val live = root.optJSONObject("live")
+            frameUrl = live?.optString("frame_url").orEmpty()
+            val running = root.optJSONObject("running_job")
+            runningType = running?.optString("type")
+            runningStep = running?.optString("current_step")?.takeIf { it.isNotEmpty() }
+        } catch (_: Exception) {
+            return // network fail = purana frame rehne do
+        }
+        // Server pe running job hai par local tracker khaali (background worker)
+        // to step yahan dikhao.
+        if (JobEngine.currentJobInfo() == null && runningType != null) {
+            liveJobText.text = "Chal raha: $runningType" +
+                (if (runningStep != null) " — $runningStep" else "")
+        }
+        if (frameUrl.isBlank()) return
+        val bmp: Bitmap? = withContext(Dispatchers.IO) {
+            try {
+                val c2 = (URL(frameUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15000
+                    readTimeout = 15000
+                }
+                val b = android.graphics.BitmapFactory.decodeStream(c2.inputStream)
+                c2.disconnect()
+                b
+            } catch (_: Exception) {
+                null
+            }
+        }
+        if (bmp != null) {
+            liveFrameImg.setImageBitmap(bmp)
+            liveFrameImg.visibility = View.VISIBLE
+        }
     }
 
     private fun refreshLive() {

@@ -131,6 +131,15 @@
                     android:text="Koi job nahi chal raha"
                     android:textSize="15sp" />
 
+                <ImageView
+                    android:id="@+id/liveFrameImg"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:adjustViewBounds="true"
+                    android:contentDescription="Phone ki live screen"
+                    android:visibility="gone" />
+
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"

@@ -4,6 +4,7 @@ import {
   enqueueJob,
   finishJob,
   getCampaign,
+  getJob,
   markSessionStale,
   recordSubmission,
   requeueJob,
@@ -62,13 +63,24 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     const { status, result } = body ?? {};
 
     if (status === "requeue") {
-      const job = await requeueJob(params.id);
+      const job = await requeueJob(params.id, "Phone ne requeue manga");
       if (!job) return NextResponse.json({ error: "job not found" }, { status: 404 });
       return NextResponse.json({ ok: true, job });
     }
 
-    if (status !== "done" && status !== "failed") {
-      return NextResponse.json({ error: "status must be done|failed|requeue" }, { status: 400 });
+    if (status !== "done" && status !== "failed" && status !== "cancelled") {
+      return NextResponse.json({ error: "status must be done|failed|cancelled|requeue" }, { status: 400 });
+    }
+
+    // Soft device-ownership check: the phone always sends its device_id;
+    // a report for another device's job is rejected (spoof-proofing).
+    // Older app versions that don't send device_id keep working.
+    const reporter = typeof body?.device_id === "string" ? body.device_id : "";
+    {
+      const job0 = await getJob(params.id);
+      if (job0 && reporter && job0.device_id !== reporter) {
+        return NextResponse.json({ error: "job belongs to another device" }, { status: 403 });
+      }
     }
 
     // Checkpoint 10: session expired -> flag for re-login prompt.
@@ -116,10 +128,11 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     // Chain engine: advance the campaign pipeline when a staged job finishes.
     // Runs after submission recording so the chain sees the final state.
     // Failures inside the chain engine must never break job reporting.
+    // Cancelled jobs skip the chain entirely — owner intent, not a result.
     try {
       if (status === "done") {
         await onJobDone(job);
-      } else {
+      } else if (status === "failed") {
         const err =
           typeof r.error === "string" ? r.error : "job failed (no error detail)";
         await onJobFailed(job, err);

@@ -26,6 +26,6 @@ export async function POST(
       { status: 409 }
     );
   }
-  const r = await requeueJob(job.id);
+  const r = await requeueJob(job.id, `Retry (dashboard se): ${job.type}`);
   return NextResponse.json({ ok: true, job: r });
 }

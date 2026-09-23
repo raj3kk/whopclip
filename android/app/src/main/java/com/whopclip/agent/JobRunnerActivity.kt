@@ -132,12 +132,20 @@ class JobRunnerActivity : Activity() {
                     // of losing it as "failed", mirroring PollWorker.
                     val needsFg = e is JobEngine.JobFailed &&
                         (e.message ?: "").startsWith("needs_foreground")
-                    val status = if (needsFg) "requeue" else "failed"
+                    val status = when {
+                        e is JobEngine.JobCancelled -> "cancelled"
+                        needsFg -> "requeue"
+                        else -> "failed"
+                    }
                     reportJob(job.getString("id"), status,
                         JSONObject().put("error", e.message ?: "unknown"))
                     if (needsFg) Log.w("JobRunner", "job requeued: ${e.message}")
                     runOnUiThread {
-                        statusText.text = if (needsFg) "Job queue me wapas ✓" else "Job fail: ${e.message}"
+                        statusText.text = when {
+                            e is JobEngine.JobCancelled -> "Job cancel ho gaya"
+                            needsFg -> "Job queue me wapas ✓"
+                            else -> "Job fail: ${e.message}"
+                        }
                         progress.visibility = View.GONE
                     }
                 }
@@ -169,6 +177,7 @@ class JobRunnerActivity : Activity() {
     private fun reportJob(id: String, status: String, result: JSONObject) {
         val url = "${SessionManager.serverUrl(this)}/api/jobs/$id"
         val body = JSONObject().put("status", status).put("result", result)
+            .put("device_id", SessionManager.deviceId(this))
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             setRequestProperty("Content-Type", "application/json")
