@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyAuthToken, AUTH_COOKIE } from "@/lib/auth";
 import { decryptSession, encryptSession } from "@/lib/crypto";
-import { getSession, saveSession } from "@/lib/store";
+import { getSession, saveSession, alreadySubmitted, recordSubmission, logActivity } from "@/lib/store";
 import {
   crFetch,
   whopCookieHeader,
   getCampaignDetail,
   probeJoinState,
+  createSubmission,
 } from "@/lib/whop";
 
 /** Content Rewards Next.js server action ids (from live /login chunks, 2026-09-23). */
@@ -230,6 +231,119 @@ export async function POST(req: NextRequest) {
       mergedJarSize: mergedCount,
       submissionsTest: { status: testStatus, code: testCode },
     });
+  }
+
+  // --- TEMP ONE-SHOT authorized submission (user authorized 2026-09-23 ~21:15 IST) ---
+  // Exactly ONE attempt, invoked by the agent only after fresh explicit user
+  // authorization. Params must EXACTLY match the authorized values; anything
+  // else is refused. Fail-closed guards: (1) store-level alreadySubmitted,
+  // (2) live session still valid, (3) no live duplicate submission,
+  // (4) zero drafts (ambiguous state -> refuse). Never reposts the Reel.
+  if (probeName === "authorized-submit") {
+    const AUTHZ = {
+      device_id: "b5cce48d-cf27-4bcb-b9fe-3c0416ed71fc",
+      campaign_id: "89b88009-5202-4f0c-a071-ba4881a1578d",
+      platform: "instagram",
+      post_url: "https://www.instagram.com/reel/DdoddKhhrgx/",
+    };
+    const device_id = q.get("device_id") ?? "";
+    const campaign_id = q.get("campaign_id") ?? "";
+    const platform = q.get("platform") ?? "";
+    const post_url = q.get("post_url") ?? "";
+    if (
+      device_id !== AUTHZ.device_id ||
+      campaign_id !== AUTHZ.campaign_id ||
+      platform !== AUTHZ.platform ||
+      post_url !== AUTHZ.post_url
+    ) {
+      return NextResponse.json(
+        { error: "params must exactly match the authorized submission" },
+        { status: 403 }
+      );
+    }
+    // Guard 1: store-level duplicate
+    if (await alreadySubmitted(device_id, campaign_id)) {
+      return NextResponse.json({ ok: true, already_submitted: true, guard: "store" });
+    }
+    const cookieHeader = await whopCookieHeader(device_id);
+    const ref = { cookieHeader, referer: "https://contentrewards.com/discover" };
+    // Guard 2: session must be valid RIGHT NOW
+    try {
+      const as = await crFetch("/api/auth/authenticate/session", ref);
+      if (as.status !== 200) {
+        return NextResponse.json(
+          { ok: false, error: `session pre-check failed: HTTP ${as.status}`, guard: "auth" },
+          { status: 502 }
+        );
+      }
+    } catch {
+      return NextResponse.json(
+        { ok: false, error: "session pre-check unreachable", guard: "auth" },
+        { status: 502 }
+      );
+    }
+    // Guard 3 (live duplicate) + Guard 4 (drafts -> ambiguous)
+    const listItems = async (path: string): Promise<unknown[]> => {
+      try {
+        const r = await crFetch(path, ref);
+        const t = await r.text().catch(() => "");
+        if (!r.ok) return [];
+        const j = JSON.parse(t) as unknown;
+        if (Array.isArray(j)) return j;
+        if (j && typeof j === "object") {
+          const o = j as Record<string, unknown>;
+          for (const k of ["items", "data", "submissions", "drafts"]) {
+            if (Array.isArray(o[k])) return o[k] as unknown[];
+          }
+        }
+      } catch { /* ignore */ }
+      return [];
+    };
+    const subs = await listItems("/api/submission/submissions?limit=50");
+    const cidOf = (o: Record<string, unknown>) =>
+      String(o.campaignId ?? o.campaign_id ?? o.campaignID ?? "");
+    if (subs.some((i) => i && typeof i === "object" && cidOf(i as Record<string, unknown>) === campaign_id)) {
+      return NextResponse.json({ ok: true, already_submitted: true, guard: "live-dupe" });
+    }
+    const drafts = await listItems("/api/submission/submission-drafts?limit=50");
+    if (drafts.length > 0) {
+      return NextResponse.json(
+        { ok: false, error: `ambiguous draft state (${drafts.length} drafts)`, guard: "drafts" },
+        { status: 409 }
+      );
+    }
+    // THE one authorized attempt.
+    const r = await createSubmission(device_id, {
+      campaignId: campaign_id,
+      platform,
+      url: post_url,
+    });
+    const now = new Date().toISOString();
+    if (!r.ok) {
+      await logActivity(device_id, "server_submit", `Authorized submit FAILED: ${r.error}`);
+      return NextResponse.json(
+        { ok: false, error: r.error, status: r.status ?? 502 },
+        { status: r.status || 502 }
+      );
+    }
+    let name: string = campaign_id;
+    try {
+      name = (await getCampaignDetail(campaign_id)).name ?? name;
+    } catch { /* ignore */ }
+    await recordSubmission({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      device_id,
+      campaign_id,
+      campaign_name: name,
+      ig_post_url: post_url,
+      status: "submitted",
+      payout_per_1k: 2,
+      views: null,
+      earned_usd: null,
+      created_at: now,
+    });
+    await logActivity(device_id, "server_submit", `Authorized one-shot submit: ${name} — ${post_url}`);
+    return NextResponse.json({ ok: true, submitted: true, attempt: "1/1", at: now });
   }
 
   if (probeName !== "submission-scope" && probeName !== "submission-dupe-check" && probeName !== "campaign-recheck") {
