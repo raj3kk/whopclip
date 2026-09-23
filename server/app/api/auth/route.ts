@@ -3,7 +3,7 @@ import {
   authCookieHeader,
   checkPassword,
   clearAuthCookieHeader,
-  ownerPasswordSet,
+  anyPasswordSet,
 } from "@/lib/auth";
 
 /**
@@ -11,9 +11,9 @@ import {
  * DELETE /api/auth -> logout
  */
 export async function POST(req: NextRequest) {
-  if (!ownerPasswordSet()) {
+  if (!anyPasswordSet()) {
     return NextResponse.json(
-      { error: "OWNER_PASSWORD not set on server — see /login setup" },
+      { error: "No owner credential set on server — see /login setup" },
       { status: 503 }
     );
   }

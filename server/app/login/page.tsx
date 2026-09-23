@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { isAuthed, ownerPasswordSet } from "@/lib/auth";
+import { isAuthed, anyPasswordSet } from "@/lib/auth";
 
 async function doLogin(formData: FormData) {
   "use server";
@@ -22,7 +22,7 @@ async function doLogin(formData: FormData) {
 export default function LoginPage({ searchParams }: { searchParams: { error?: string } }) {
   if (isAuthed()) redirect("/dashboard");
 
-  if (!ownerPasswordSet()) {
+  if (!anyPasswordSet()) {
     return (
       <div className="wrap" style={{ maxWidth: 640 }}>
         <div className="card" style={{ marginTop: 40 }}>
@@ -34,6 +34,7 @@ export default function LoginPage({ searchParams }: { searchParams: { error?: st
           <ol className="muted" style={{ lineHeight: 2 }}>
             <li>Project <b>whopclip</b> → Settings → Environment Variables</li>
             <li>Naya variable: <code>OWNER_PASSWORD</code> = apna strong password</li>
+            <li>Optional: <code>AGENT_PASSWORD</code> = automation ke liye alag password</li>
             <li>Save → Redeploy</li>
           </ol>
           <p className="muted">Uske baad ye page login form dikhayega.</p>
@@ -46,7 +47,7 @@ export default function LoginPage({ searchParams }: { searchParams: { error?: st
     <div className="wrap" style={{ maxWidth: 440 }}>
       <div className="card" style={{ marginTop: 40 }}>
         <h2>Owner login</h2>
-        <p className="muted">Dashboard aur app pairing ke liye login karo.</p>
+        <p className="muted">Dashboard aur app pairing ke liye login karo. (Apna password ya agent password — dono chalenge.)</p>
         {searchParams.error && (
           <div className="alert err">Galat password. Dobara try karo.</div>
         )}
