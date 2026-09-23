@@ -31,14 +31,20 @@ export async function GET(
     const e = await earningsSummary(device_id);
     earnings = `$${e?.total_earned_usd ?? 0}`;
   } catch { /* optional */ }
-  return NextResponse.json({
-    device_id: d.device_id,
-    status: online ? "online" : "offline",
-    last_seen: d.last_poll_at,
-    paired_at: d.paired_at,
-    app_version: d.app_version,
-    device_model: d.device_model,
-    jobs_today: String(jobsToday),
-    earnings,
-  });
+  return NextResponse.json(
+    {
+      device_id: d.device_id,
+      status: online ? "online" : "offline",
+      last_seen: d.last_poll_at,
+      paired_at: d.paired_at,
+      app_version: d.app_version,
+      device_model: d.device_model,
+      jobs_today: String(jobsToday),
+      earnings,
+      // TEMP build marker (2026-09-23): proves which deployment served this
+      // route while diagnosing the frozen-status read path. REMOVE after fix.
+      build: "no-store+fd-20260923",
+    },
+    { headers: { "Cache-Control": "no-store" } }
+  );
 }

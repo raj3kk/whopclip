@@ -24,6 +24,10 @@ async function sb(
 ): Promise<{ status: number; json: unknown }> {
   const res = await fetch(`${SB_URL}${path}`, {
     method,
+    // Never let Next's data cache serve a stale device/session/job read:
+    // the phone's status screen and the automation loop depend on fresh DB
+    // values every request (2026-09-23: frozen status for hours).
+    cache: "no-store",
     headers: {
       apikey: SB_KEY,
       Authorization: `Bearer ${SB_KEY}`,
