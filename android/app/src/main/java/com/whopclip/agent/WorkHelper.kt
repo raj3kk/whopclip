@@ -2,24 +2,40 @@ package com.whopclip.agent
 
 import android.content.Context
 import android.util.Log
+import androidx.work.Configuration
 import androidx.work.WorkManager
 
 /**
- * Lazy WorkManager access — v13: auto-init via androidx.startup.
+ * Lazy WorkManager access — v14: guarded manual init (AutoClip pattern).
  *
- * v12 HISTORY: manual WorkManager.initialize() hit an on-device
- * NoClassDefFoundError ("Failed resolution") that exhaustive static dex
- * analysis could NOT explain — all 407 work-runtime classes, Room/SQLite/
- * Guava/startup/Kotlin-FunctionN, and Room's generated _Impl classes are
- * present in the dex. Root cause of the v11 dead-end was the blind
- * initialize() + swallowed IllegalStateException; v12 surfaced the real
- * error but manual init stayed broken on-device.
+ * ROOT-CAUSE HISTORY (all proven from bytecode + dex forensics, 2026-09-23):
+ * - v11: ensure() called WorkManager.initialize() BLINDLY on every call.
+ *   Already-initialized -> IllegalStateException, swallowed -> ensure()
+ *   false FOREVER. Online could never start automation.
+ * - v12: fixed to getInstance-first + guarded init, and surfaced the real
+ *   error: NoClassDefFoundError "Failed resolution". Static dex analysis
+ *   "could not explain it" because it only checked work-runtime classes —
+ *   the missing class was androidx.work.R$bool (referenced by
+ *   WorkManagerImplExtKt.createWorkManager for
+ *   R.bool.workmanager_test_configuration). The manual build only generated
+ *   the APP's R class, never the LIBRARY R classes AAR bytecode references.
+ * - v13: moved to androidx.startup auto-init. Same bug class, worse timing:
+ *   AppInitializer touches androidx.startup.R$string inside
+ *   InitializationProvider.onCreate() — before Application.onCreate, outside
+ *   any try/catch we control -> app died instantly on launch.
  *
- * v13 FIX: use the OFFICIAL init path — androidx.startup.InitializationProvider
- * (declared in AndroidManifest) auto-initializes WorkManager at process
- * start via WorkManagerInitializer. No manual initialize() call anywhere.
- * ensure() now only asks getInstance(); if auto-init failed, the error is
- * reported instead of retrying a broken manual path.
+ * v14 FIX (two layers):
+ *  1. BUILD (tools/gen_lib_r.py): every AAR's library R class is generated
+ *     from its R.txt with the final merged resource ids, compiled and dexed.
+ *     The dex guard in build-apk.sh fails the build if any library R class
+ *     is missing. This is the true root fix.
+ *  2. RUNTIME: no InitializationProvider in the manifest (nothing
+ *     WorkManager-related runs at process start, ever). ensure() uses
+ *     getInstance-first, then ONE synchronized guarded initialize(), then a
+ *     verifying getInstance(). Every Throwable is caught; the real error
+ *     stays visible in lastError (toast + Live tab). A WorkManager failure
+ *     can delay automation — it can never again kill the app or wedge
+ *     Online into a permanent "dobara try karo" state.
  *
  * Call [ensure] only from a user action ("Online"), from PollService, or
  * from BootReceiver — never from Application.onCreate / Activity.onCreate.
@@ -33,20 +49,39 @@ object WorkHelper {
 
     /**
      * True when WorkManager is usable in this process. Never throws.
-     * Relies on androidx.startup auto-init (see AndroidManifest).
+     * getInstance() first; guarded manual initialize() only when needed.
      */
     fun ensure(ctx: Context): Boolean {
-        return try {
+        // Fast path: already initialized in this process.
+        try {
             WorkManager.getInstance(ctx)
             lastError = ""
-            true
-        } catch (t: Throwable) {
-            // Auto-init did not happen (provider missing/disabled) or failed.
-            // Do NOT attempt manual initialize() — v12 proved that path
-            // throws NoClassDefFoundError on-device.
-            lastError = "getInstance: ${t.javaClass.simpleName}: ${t.message}"
-            Log.e(TAG, "WorkManager.getInstance failed (auto-init missing?)", t)
-            false
+            return true
+        } catch (_: Throwable) {
+            // Not initialized yet (or init previously failed) — fall through
+            // to the single guarded initialize() below.
+        }
+        return synchronized(this) {
+            try {
+                // Double-check inside the lock (two threads racing Online).
+                try {
+                    WorkManager.getInstance(ctx)
+                    lastError = ""
+                    return true
+                } catch (_: Throwable) { }
+                WorkManager.initialize(
+                    ctx.applicationContext,
+                    Configuration.Builder().build()
+                )
+                WorkManager.getInstance(ctx)
+                lastError = ""
+                Log.i(TAG, "WorkManager initialized (guarded manual init)")
+                true
+            } catch (t: Throwable) {
+                lastError = "init: ${t.javaClass.simpleName}: ${t.message}"
+                Log.e(TAG, "WorkManager init failed", t)
+                false
+            }
         }
     }
 

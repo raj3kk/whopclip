@@ -58,19 +58,14 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
-        <!-- WorkManager auto-init via androidx.startup (official path).
-             v12's manual WorkManager.initialize() hit a NoClassDefFoundError
-             on-device that static dex analysis could not explain (all 407
-             work-runtime classes + Room/SQLite/Guava/Kotlin present). The
-             startup ContentProvider path is Google's tested init route. -->
-        <provider
-            android:name="androidx.startup.InitializationProvider"
-            android:authorities="com.whopclip.agent.androidx-startup"
-            android:exported="false">
-            <meta-data
-                android:name="androidx.work.WorkManagerInitializer"
-                android:value="androidx.startup" />
-        </provider>
+        <!-- NOTE (v14): androidx.startup.InitializationProvider is DELIBERATELY
+             NOT declared. v13 declared it for WorkManager auto-init and the
+             app died instantly on launch: AppInitializer touches
+             androidx.startup.R$string, which the old build never generated
+             (NoClassDefFoundError inside the provider = before
+             Application.onCreate, uncatchable). v14 generates all library R
+             classes at build time AND keeps WorkManager init lazy + guarded
+             (WorkHelper) so a WorkManager failure can never kill the launch. -->
 
     </application>
 </manifest>

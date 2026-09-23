@@ -4,7 +4,7 @@ import PairBox from "./pair-box";
 
 export default function ConnectPage() {
   if (!isAuthed()) redirect("/login");
-  const apkUrl = "/whopclip-v11.apk";
+  const apkUrl = "/whopclip-v14.apk";
   return (
     <div className="wrap" style={{ maxWidth: 720 }}>
       <h1 style={{ marginTop: 28 }}>📱 App connect karo</h1>
@@ -39,7 +39,7 @@ export default function ConnectPage() {
       <div className="card">
         <h3>Step 4 — Whop + Instagram login</h3>
         <p className="muted">
-          App me <b>Browser</b> tab kholo → pehle Whop, phir Instagram me login karo.
+          App me <b>Login</b> tab kholo → pehle Whop, phir Instagram me login karo.
           Session encrypted server pe save hogi — dobara login nahi karna padega
           jab tak session expire na ho.
         </p>

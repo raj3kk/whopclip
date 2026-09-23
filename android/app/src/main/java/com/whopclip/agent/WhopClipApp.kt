@@ -22,6 +22,11 @@ import java.util.Locale
  * If anything still crashes at startup, the uncaught-exception handler writes
  * the full stack trace to <files>/crash.log and the next launch shows it in
  * the diagnostic card instead of silently dying.
+ *
+ * v14: WorkManager auto-init provider REMOVED from the manifest (it killed
+ * the launch when a library R class was missing — before this handler could
+ * even install). WorkManager now initializes lazily + guarded via
+ * WorkHelper; the build generates all library R classes (gen_lib_r.py).
  */
 class WhopClipApp : Application() {
     companion object {
@@ -53,6 +58,6 @@ class WhopClipApp : Application() {
             } catch (_: Exception) { }
             prev?.uncaughtException(thread, throwable)
         }
-        Log.i(TAG, "WhopClipApp started (v6, no WorkManager at launch)")
+        Log.i(TAG, "WhopClipApp started (v14, no WorkManager at launch)")
     }
 }
