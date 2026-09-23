@@ -397,7 +397,7 @@ async function authedApi<T>(
     // Non-JSON (e.g. login HTML) — treat by status code below.
   }
   if (res.status === 401 || res.status === 403) {
-    return { ok: false, status: res.status, data, error: "whop session rejected (re-login in app)" };
+    return { ok: false, status: res.status, data, error: `whop session rejected (re-login in app) [${text.slice(0, 180)}]` };
   }
   if (res.status >= 400) {
     const msg =
