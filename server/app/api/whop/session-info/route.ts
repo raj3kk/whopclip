@@ -77,6 +77,16 @@ export async function POST(req: NextRequest) {
   ) as Record<string, string>;
   const cookieHeader = await whopCookieHeader(device_id);
   const authMode = q.get("auth") ?? "cookies";
+  // minimal: only Whop session cookies (drop analytics/tracking junk that might
+  // break the server's cookie parser with special chars)
+  const useHeader =
+    authMode === "minimal"
+      ? cookieHeader
+          .split(";")
+          .map((p) => p.trim())
+          .filter((p) => /^(whop-core\.|__Secure-whop\.|__Host-whop-core\.|_whop_ssk=)/.test(p))
+          .join("; ")
+      : cookieHeader;
   const bearer =
     authMode === "bearer-access"
       ? String(jar["whop-core.access-token"] ?? "")
@@ -95,7 +105,7 @@ export async function POST(req: NextRequest) {
     try {
       const res = await crFetch(path, {
         method,
-        cookieHeader,
+        cookieHeader: useHeader,
         referer: "https://contentrewards.com/discover",
         bearer,
         ...(json !== undefined ? { json } : {}),
