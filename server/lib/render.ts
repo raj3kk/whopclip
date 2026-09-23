@@ -37,6 +37,8 @@ export interface RenderSpec {
   /** exact caption to burn into the post step */
   caption: string;
   status: "queued" | "claimed" | "done" | "failed";
+  /** worker-side attempts (transient infra failures requeue, capped) */
+  worker_attempts: number;
   video_url: string | null;
   /** real cover frame URL (ffmpeg-extracted source frame) — required when done */
   cover_url: string | null;
@@ -98,6 +100,7 @@ export function buildRenderSpec(
     hook_text: hook,
     caption,
     status: "queued",
+    worker_attempts: 0,
     video_url: null,
     cover_url: null,
     error: null,
@@ -130,6 +133,29 @@ export async function claimRender(): Promise<RenderSpec | null> {
     return spec;
   }
   return null;
+}
+
+/**
+ * Requeue a spec after a TRANSIENT worker failure (network blip, timeout).
+ * The VM worker's 5-min cron picks it up again. Capped: caller must check
+ * worker_attempts before calling.
+ */
+export async function requeueRender(id: string, error: string): Promise<RenderSpec | null> {
+  const spec = await getRender(id);
+  if (!spec) return null;
+  spec.status = "queued";
+  spec.worker_attempts = (spec.worker_attempts ?? 0) + 1;
+  spec.error = error;
+  spec.updated_at = new Date().toISOString();
+  await kv.set(renderKey(id), spec);
+  return spec;
+}
+
+const TRANSIENT_RENDER_ERROR = /timeout|timed out|ECONNRESET|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|Remote end closed|IncompleteRead|connection (reset|closed|refused|aborted)|network unreachable|temporary failure/i;
+
+/** True when a worker error looks like transient infra (safe to requeue). */
+export function isTransientRenderError(error: string): boolean {
+  return TRANSIENT_RENDER_ERROR.test(error || "");
 }
 
 export async function finishRender(

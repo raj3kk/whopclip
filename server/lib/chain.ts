@@ -732,6 +732,21 @@ export async function onRenderDone(
     return chain;
   }
   if (!ok) {
+    // Transient worker infra failure (network blip, timeout): requeue the
+    // spec so the VM worker's cron retries, keep the chain parked at render.
+    // Permanent failures (no speech, bad source) still fail the chain.
+    const { requeueRender, isTransientRenderError } = await import("./render");
+    const errText = (await getRender(render_id))?.error ?? "";
+    if (isTransientRenderError(errText)) {
+      const spec2 = await getRender(render_id);
+      if ((spec2?.worker_attempts ?? 0) < 3) {
+        await requeueRender(render_id, errText);
+        chain.error = `render worker hit transient infra (${errText.slice(0, 120)}) — requeued, retrying`;
+        chain.updated_at = new Date().toISOString();
+        await saveChain(chain);
+        return chain; // parked at render; worker cron resumes
+      }
+    }
     await failChain(chain, "render worker failed (see render spec error)");
     return chain;
   }
