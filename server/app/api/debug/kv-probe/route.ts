@@ -7,9 +7,44 @@ const SB_URL =
 const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 
 export async function GET(req: Request) {
+  const url = new URL(req.url);
   const device_id =
-    new URL(req.url).searchParams.get("device_id") ||
+    url.searchParams.get("device_id") ||
     "b5cce48d-cf27-4bcb-b9fe-3c0416ed71fc";
+  // one-off restore of the device row clobbered by the earlier probe PATCH
+  if (url.searchParams.get("restore") === "1") {
+    const full = `whopclip:device:${device_id}`;
+    const cur = await fetch(
+      `${SB_URL}/rest/v1/flipify_kv?device_id=eq.whopclip&key=eq.${encodeURIComponent(full)}&select=value`,
+      { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
+    ).then((r) => r.json());
+    const curV = (cur[0]?.value ?? {}) as Record<string, unknown>;
+    const restored = {
+      device_id,
+      paired_at: "2026-09-23T04:31:15.532Z",
+      app_version: curV.app_version ?? "14",
+      device_model: curV.device_model ?? "vivo V2240",
+      last_poll_at: curV.last_poll_at ?? null,
+      presence: curV.presence ?? "offline",
+    };
+    const res = await fetch(
+      `${SB_URL}/rest/v1/flipify_kv?device_id=eq.whopclip&key=eq.${encodeURIComponent(full)}`,
+      {
+        method: "PATCH",
+        headers: {
+          apikey: SB_KEY,
+          Authorization: `Bearer ${SB_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=representation",
+        },
+        body: JSON.stringify({
+          value: restored,
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+    return NextResponse.json({ restored, patchStatus: res.status });
+  }
   const full = `whopclip:device:${device_id}`;
   const out: Record<string, unknown> = {};
   try {

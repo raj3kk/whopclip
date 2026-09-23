@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import { getDevice, deviceOnline, listJobs, earningsSummary } from "@/lib/store";
 
+/** Live device facts — never prerender (2026-09-23: static prerender served
+ *  a frozen last_seen for hours while the DB kept updating). */
+export const dynamic = "force-dynamic";
+
 /**
  * GET /api/devices/[id]/status — what the phone's Profile tab shows after
  * pairing: the same device facts the website dashboard shows (status,
