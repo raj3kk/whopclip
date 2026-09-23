@@ -59,65 +59,91 @@ interface ProbeOutcome {
 }
 
 /**
- * Whop probe: GET https://whop.com/dashboard/ with the saved cookies.
- * Logged-out users are bounced to a login page; logged-in users get 200
- * with dashboard content. redirect:"manual" lets us see the bounce.
+ * Whop probe: GET https://whop.com/dashboard/ with the saved cookies,
+ * following redirects manually (up to 3 hops). Logged-out users are bounced
+ * to a login page; logged-in users land on their dashboard/townhall.
  */
 async function probeWhop(
   cookieHeader: string,
   userAgent: string
 ): Promise<ProbeOutcome> {
-  let res: Response;
+  const headers = {
+    Cookie: cookieHeader,
+    "User-Agent": userAgent,
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+  let url = "https://whop.com/dashboard/";
+  let hops = 0;
   try {
-    res = await fetchWithTimeout("https://whop.com/dashboard/", {
-      method: "GET",
-      redirect: "manual",
-      headers: {
-        Cookie: cookieHeader,
-        "User-Agent": userAgent,
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
+    while (hops < 3) {
+      const res = await fetchWithTimeout(url, {
+        method: "GET",
+        redirect: "manual",
+        headers,
+      });
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get("location") || "";
+        const lowLoc = loc.toLowerCase();
+        // Definitive logged-out bounce.
+        if (
+          lowLoc.includes("login") ||
+          lowLoc.includes("signin") ||
+          lowLoc.includes("/auth")
+        ) {
+          return { valid: false, detail: `bounced to login (${res.status} -> ${loc.slice(0, 80)})` };
+        }
+        // Follow internal redirects (e.g. /dashboard/ -> /townhall/).
+        url = new URL(loc, url).toString();
+        hops++;
+        continue;
+      }
+      if (res.status === 429) return { valid: null, detail: "rate limited (429)" };
+      if (res.status >= 500) return { valid: null, detail: `server error (${res.status})` };
+      if (res.status !== 200) {
+        return { valid: null, detail: `unexpected status ${res.status} at ${url.slice(0, 60)}` };
+      }
+      let html = "";
+      try {
+        html = await res.text();
+      } catch {
+        return { valid: null, detail: "could not read response body" };
+      }
+      const low = html.toLowerCase();
+      // Login-page content = definitively logged out.
+      if (
+        low.includes("password") &&
+        (low.includes("log in to") || low.includes("sign in to")) &&
+        low.length < 300000
+      ) {
+        return { valid: false, detail: "login page content returned" };
+      }
+      // Landed on an authenticated area (dashboard/townhall/discover) with
+      // real content and no login markers = session alive.
+      const host = new URL(url).pathname.toLowerCase();
+      const authedArea =
+        host.includes("dashboard") ||
+        host.includes("townhall") ||
+        host.includes("discover") ||
+        host.includes("hub");
+      if (low.length > 5000 && authedArea) {
+        return {
+          valid: true,
+          detail: `landed on ${host.slice(0, 40)} (${(low.length / 1024).toFixed(0)}kb, ${hops} redirect${hops === 1 ? "" : "s"})`,
+        };
+      }
+      return {
+        valid: null,
+        detail: `landed on ${host.slice(0, 60)} — ambiguous content`,
+      };
+    }
+    return { valid: null, detail: "too many redirects" };
   } catch (e) {
     return {
       valid: null,
       detail: `network error: ${e instanceof Error ? e.message : "unknown"}`,
     };
   }
-  // Bounced to login?
-  if (res.status >= 300 && res.status < 400) {
-    const loc = (res.headers.get("location") || "").toLowerCase();
-    if (loc.includes("login") || loc.includes("signin") || loc.includes("auth")) {
-      return { valid: false, detail: `redirected to login (${res.status} -> ${loc.slice(0, 80)})` };
-    }
-    return { valid: null, detail: `unexpected redirect (${res.status} -> ${loc.slice(0, 80)})` };
-  }
-  if (res.status === 429) return { valid: null, detail: "rate limited (429)" };
-  if (res.status >= 500) return { valid: null, detail: `server error (${res.status})` };
-  let html = "";
-  try {
-    html = await res.text();
-  } catch {
-    return { valid: null, detail: "could not read response body" };
-  }
-  const low = html.toLowerCase();
-  // Definitive logged-out markers on the returned page.
-  if (
-    low.includes('href="/login"') ||
-    low.includes("'/login'") ||
-    /log in to whop/i.test(html)
-  ) {
-    // Make sure it's really a login page, not just a login link in a footer.
-    if (low.includes("password") && (low.includes("log in") || low.includes("sign in")) && low.length < 200000) {
-      return { valid: false, detail: "login page content returned" };
-    }
-  }
-  if (res.status === 200 && low.length > 5000) {
-    return { valid: true, detail: `dashboard reachable (${res.status}, ${(low.length / 1024).toFixed(0)}kb)` };
-  }
-  return { valid: null, detail: `unexpected status ${res.status}` };
 }
 
 /**
