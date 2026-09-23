@@ -644,3 +644,32 @@ export async function markScheduleRun(device_id: string): Promise<void> {
   s.last_run_date = new Date().toISOString().slice(0, 10);
   await setSchedule(s);
 }
+
+/* ---------------- live activity ---------------- */
+
+/**
+ * Latest live frame per device: the phone uploads a downscaled WebView
+ * screenshot (key "live") after every job step, plus a heartbeat with the
+ * current step. The dashboard Live tab shows this — "phone abhi kya kar
+ * raha hai" — with the job history below it.
+ */
+export interface LiveFrame {
+  device_id: string;
+  job_id: string;
+  job_type: string;
+  current_step: string;
+  frame_url: string;
+  updated_at: string;
+}
+
+export async function setLiveFrame(
+  f: Omit<LiveFrame, "updated_at">
+): Promise<LiveFrame> {
+  const full: LiveFrame = { ...f, updated_at: new Date().toISOString() };
+  await kv.set(`liveframe:${f.device_id}`, full);
+  return full;
+}
+
+export async function getLiveFrame(device_id: string): Promise<LiveFrame | null> {
+  return (await kv.get(`liveframe:${device_id}`)) as LiveFrame | null;
+}

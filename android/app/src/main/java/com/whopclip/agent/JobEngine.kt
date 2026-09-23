@@ -25,6 +25,7 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * Executes server-sent JSON step specs inside a WebView.
@@ -47,6 +48,12 @@ import kotlin.coroutines.resume
  * reported result — the server then flags the session stale (re-login prompt).
  *
  * Returns JSONObject of extracted values on success, or throws JobFailed.
+ *
+ * Live reporting: after every step the engine POSTs a heartbeat to
+ * /api/jobs/{id}/heartbeat (current step) and uploads a downscaled live
+ * frame (key "live") to /api/frames — the dashboard Live tab shows the
+ * phone's screen at the top with job history below. Reporting failures
+ * never fail the job.
  */
 class JobEngine(private val ctx: Context) {
     private val TAG = "JobEngine"
@@ -171,7 +178,13 @@ class JobEngine(private val ctx: Context) {
      * NOTE: single output stream for the whole multipart body — reopening
      * HttpURLConnection's stream mid-request breaks the upload.
      */
-    private suspend fun uploadFrame(job: JSONObject, key: String, path: String): String? =
+    private suspend fun uploadFrame(
+        job: JSONObject,
+        key: String,
+        path: String,
+        contentType: String = "image/png",
+        extraFields: Map<String, String> = emptyMap()
+    ): String? =
         withContext(Dispatchers.IO) {
             try {
                 val file = File(path)
@@ -196,9 +209,10 @@ class JobEngine(private val ctx: Context) {
                 field("device_id", deviceId)
                 field("job_id", jobId)
                 field("key", key)
+                for ((k, v) in extraFields) field(k, v)
                 out.write("--$boundary\r\n".toByteArray())
                 out.write("Content-Disposition: form-data; name=\"frame\"; filename=\"$key\"\r\n".toByteArray())
-                out.write("Content-Type: image/png\r\n\r\n".toByteArray())
+                out.write("Content-Type: $contentType\r\n\r\n".toByteArray())
                 file.inputStream().use { it.copyTo(out) }
                 out.write("\r\n--$boundary--\r\n".toByteArray())
                 out.flush()
@@ -216,6 +230,99 @@ class JobEngine(private val ctx: Context) {
             } catch (e: Exception) {
                 Log.w(TAG, "frame upload error: ${e.message}")
                 null
+            }
+        }
+
+    /**
+     * Live reporting after every job step: sends a heartbeat to
+     * POST /api/jobs/{id}/heartbeat (server knows the job is alive and
+     * which step it's on) and uploads a downscaled live frame (key "live")
+     * to POST /api/frames (dashboard Live tab shows the phone's screen).
+     * All failures are swallowed — reporting must never fail the job.
+     */
+    private suspend fun reportLive(job: JSONObject, wv: WebView, stepDesc: String) {
+        setCurrentJob(
+            "Chal raha: ${job.optString("type", "job")} " +
+                "${job.optString("id", "").take(8)} — $stepDesc"
+        )
+        try {
+            postHeartbeat(job, stepDesc)
+        } catch (e: Exception) {
+            Log.w(TAG, "heartbeat failed: ${e.message}")
+        }
+        try {
+            uploadLiveFrame(job, wv, stepDesc)
+        } catch (e: Exception) {
+            Log.w(TAG, "live frame failed: ${e.message}")
+        }
+    }
+
+    private suspend fun postHeartbeat(job: JSONObject, step: String) =
+        withContext(Dispatchers.IO) {
+            val deviceId = SessionManager.deviceId(ctx)
+            val jobId = job.optString("id", "")
+            if (jobId.isBlank()) return@withContext
+            val url = "${SessionManager.serverUrl(ctx)}/api/jobs/$jobId/heartbeat"
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                setRequestProperty("Content-Type", "application/json")
+                connectTimeout = 15000
+                readTimeout = 15000
+                doOutput = true
+            }
+            try {
+                val body = JSONObject()
+                    .put("device_id", deviceId)
+                    .put("current_step", step)
+                    .toString()
+                conn.outputStream.use { it.write(body.toByteArray()) }
+                Log.i(TAG, "heartbeat -> $step (HTTP ${conn.responseCode})")
+            } finally {
+                conn.disconnect()
+            }
+        }
+
+    /**
+     * Captures the WebView, downscales to 360px wide JPEG (quality 55) and
+     * uploads as key "live" with job_type + current_step fields.
+     */
+    private suspend fun uploadLiveFrame(job: JSONObject, wv: WebView, step: String) =
+        withContext(Dispatchers.IO) {
+            val bmp = suspendCancellableCoroutine<android.graphics.Bitmap> { cont ->
+                mainHandler.post {
+                    try {
+                        val b = android.graphics.Bitmap.createBitmap(
+                            wv.width.coerceAtLeast(1),
+                            wv.height.coerceAtLeast(1),
+                            android.graphics.Bitmap.Config.ARGB_8888
+                        )
+                        wv.draw(android.graphics.Canvas(b))
+                        cont.resume(b)
+                    } catch (e: Exception) {
+                        cont.resumeWithException(e)
+                    }
+                }
+            }
+            try {
+                val sw = 360
+                val sh = (bmp.height * sw / bmp.width).coerceAtLeast(1)
+                val scaled = android.graphics.Bitmap.createScaledBitmap(bmp, sw, sh, true)
+                val dir = File(ctx.cacheDir, "frames").apply { mkdirs() }
+                val out = File(dir, "live.jpg")
+                FileOutputStream(out).use { fos ->
+                    scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 55, fos)
+                }
+                scaled.recycle()
+                Log.i(TAG, "live frame: ${out.length()} bytes")
+                uploadFrame(
+                    job, "live", out.absolutePath, "image/jpeg",
+                    mapOf(
+                        "job_type" to job.optString("type", ""),
+                        "current_step" to step
+                    )
+                )
+            } finally {
+                bmp.recycle()
             }
         }
 
@@ -286,7 +393,12 @@ class JobEngine(private val ctx: Context) {
                 var created: WebView? = null
                 suspendCancellableCoroutine<Unit> { cont ->
                     mainHandler.post {
-                        created = makeWebView()
+                        val wv2 = makeWebView()
+                        // Headless WebView ko viewport do taaki live frames
+                        // aur verify screenshots ka size real ho (bina layout
+                        // ke width/height 0 hote hain).
+                        wv2.layout(0, 0, 480, 854)
+                        created = wv2
                         cont.resume(Unit)
                     }
                 }
@@ -430,6 +542,9 @@ class JobEngine(private val ctx: Context) {
                         else -> throw JobFailed("unknown action: ${s.optString("action")}")
                     }
                     Log.i(TAG, "step $i ok: ${s.optString("action")}")
+                    // Live reporting: heartbeat + live frame after every step.
+                    // Never fails the job — errors are caught inside.
+                    reportLive(job, wv, "step ${i + 1}/${steps.length()}: ${s.optString("action")}")
                 }
             } finally {
                 if (ownsWebView) mainHandler.post { wv.destroy() }

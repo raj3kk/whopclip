@@ -12,7 +12,7 @@ export default function Home() {
         </p>
         <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
           <a href="/login" className="btn">Get Started</a>
-          <a href="/whopclip-v14.apk" className="btn ghost">Download App (APK)</a>
+          <a href="/whopclip-v15.apk" className="btn ghost">Download App (APK)</a>
         </div>
       </section>
 

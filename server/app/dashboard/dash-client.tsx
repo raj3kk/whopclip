@@ -20,6 +20,19 @@ type Campaign = {
 type Job = {
   id: string; type: string; status: string; steps: unknown[];
   result: unknown; created_at: string; updated_at: string;
+  current_step?: string | null; last_heartbeat?: string | null;
+  heartbeat_count?: number;
+};
+type LiveData = {
+  live: {
+    device_id: string; job_id: string; job_type: string;
+    current_step: string; frame_url: string; updated_at: string;
+  } | null;
+  running_job: {
+    id: string; type: string; current_step: string | null;
+    heartbeat_count: number; last_heartbeat: string | null;
+    steps_total: number; updated_at: string;
+  } | null;
 };
 type Submission = {
   id: string; campaign_name: string; ig_post_url: string; status: string;
@@ -63,6 +76,8 @@ export default function Dashboard() {
   const [runStep, setRunStep] = useState<Record<string, string>>({});
   const [caption, setCaption] = useState<Record<string, string>>({});
   const [videoUrl, setVideoUrl] = useState<Record<string, string>>({});
+  const [live, setLive] = useState<LiveData | null>(null);
+  const [discoverUrl, setDiscoverUrl] = useState("https://whop.com/content-rewards");
 
   const load = useCallback(async () => {
     const d = await jget("/api/devices");
@@ -95,6 +110,19 @@ export default function Dashboard() {
     return () => clearInterval(t);
   }, [load]);
 
+  // Live tab: poll the phone's live frame + running job every 5s.
+  useEffect(() => {
+    if (tab !== "live" || !deviceId) return;
+    let stop = false;
+    const fetchLive = async () => {
+      const r = await jget(`/api/live?device_id=${encodeURIComponent(deviceId)}`);
+      if (!stop && r.ok) setLive(r.j as LiveData);
+    };
+    fetchLive();
+    const t = setInterval(fetchLive, 5000);
+    return () => { stop = true; clearInterval(t); };
+  }, [tab, deviceId]);
+
   async function runNow(c: Campaign) {
     const step = runStep[c.id] || "full";
     const body: Record<string, unknown> = { device_id: deviceId, step, campaign_id: c.id };
@@ -119,6 +147,65 @@ export default function Dashboard() {
     if (!r.ok) alert("Schedule save failed: " + (r.j.error || r.status));
     else load();
   }
+
+  async function discoverNow() {
+    const url = discoverUrl.trim();
+    if (!url) { alert("Discover URL daalo"); return; }
+    setBusy("discover");
+    const r = await jpost("/api/run", { device_id: deviceId, step: "discover", discover_url: url });
+    setBusy(null);
+    if (!r.ok) alert("Discover failed: " + (r.j.error || r.status));
+    else { setTab("jobs"); load(); }
+  }
+
+  async function retryJob(id: string) {
+    setBusy(id);
+    const r = await jpost(`/api/jobs/${id}/retry`, {});
+    setBusy(null);
+    if (!r.ok) alert("Retry failed: " + (r.j.error || r.status));
+    else load();
+  }
+
+  async function requeueStuck() {
+    setBusy("stuck");
+    const r = await jpost("/api/jobs/requeue-stuck", { device_id: deviceId });
+    setBusy(null);
+    if (!r.ok) alert("Requeue failed: " + (r.j.error || r.status));
+    else { alert(`Requeued: ${r.j.requeued?.length ?? 0} job(s)`); load(); }
+  }
+
+  function statusBadge(s: string) {
+    const cls = s === "done" ? "green" : s === "failed" ? "red" : s === "running" ? "blue" : "grey";
+    return <span className={`badge ${cls}`}>{s}</span>;
+  }
+
+  function jobRow(j: Job) {
+    return (
+      <details className="job" key={j.id}>
+        <summary>
+          {statusBadge(j.status)}
+          <b>{j.type}</b>
+          <span className="muted">{j.steps.length} steps · {timeAgo(j.updated_at)}</span>
+          {j.status === "failed" && (
+            <button
+              className="btn small green"
+              disabled={busy === j.id}
+              onClick={(e) => { e.preventDefault(); retryJob(j.id); }}
+            >
+              {busy === j.id ? "…" : "↻ Retry"}
+            </button>
+          )}
+        </summary>
+        <div className="body">
+          {j.current_step && <div style={{ fontSize: 13, marginBottom: 6 }}>📍 {j.current_step}</div>}
+          <div className="muted" style={{ fontSize: 12 }}>id: <code>{j.id}</code></div>
+          <pre className="logs">{JSON.stringify(j.result ?? { steps: j.steps.length, note: "no result yet" }, null, 2)}</pre>
+        </div>
+      </details>
+    );
+  }
+
+  const sortedJobs = [...jobs].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
 
   async function logout() {
     await fetch("/api/auth", { method: "DELETE" });
@@ -168,15 +255,35 @@ export default function Dashboard() {
       )}
 
       <div className="tabs">
-        {(["campaigns", "jobs", "earnings", "phone"] as const).map((t) => (
+        {(["campaigns", "live", "jobs", "earnings", "phone"] as const).map((t) => (
           <button key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-            {t === "campaigns" ? "🎯 Campaigns" : t === "jobs" ? `⚙️ Jobs (${jobs.filter((j) => j.status === "queued" || j.status === "running").length})` : t === "earnings" ? `💰 Earnings ($${earned.toFixed(2)})` : "📱 Phone"}
+            {t === "campaigns" ? "🎯 Campaigns" : t === "live" ? "🔴 Live" : t === "jobs" ? `⚙️ Jobs (${jobs.filter((j) => j.status === "queued" || j.status === "running").length})` : t === "earnings" ? `💰 Earnings ($${earned.toFixed(2)})` : "📱 Phone"}
           </button>
         ))}
       </div>
 
       {tab === "campaigns" && (
         <>
+          <div className="card">
+            <h3 style={{ marginTop: 0 }}>🔍 Campaigns discover karo</h3>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "end" }}>
+              <div style={{ flex: 1, minWidth: 220 }}>
+                <label>Discover URL</label>
+                <input
+                  value={discoverUrl}
+                  onChange={(e) => setDiscoverUrl(e.target.value)}
+                  placeholder="https://whop.com/content-rewards"
+                />
+              </div>
+              <button className="btn small green" disabled={busy === "discover" || !dev?.online} onClick={discoverNow}>
+                {busy === "discover" ? "…" : "🔍 Discover"}
+              </button>
+            </div>
+            <p className="muted" style={{ fontSize: 13 }}>
+              List khaali ho to bhi yahan se discover chala sakte ho — phone Whop se campaign cards
+              nikaal ke yahan save karega.
+            </p>
+          </div>
           <div className="card">
             <h3 style={{ marginTop: 0 }}>⏰ Daily schedule</h3>
             <div style={{ display: "flex", gap: 10, alignItems: "end", flexWrap: "wrap" }}>
@@ -237,22 +344,53 @@ export default function Dashboard() {
         </>
       )}
 
+      {tab === "live" && (
+        <>
+          <div className="card">
+            <h3 style={{ marginTop: 0 }}>🔴 Live — phone abhi kya kar raha hai</h3>
+            {!live ? (
+              <p className="muted">Loading…</p>
+            ) : !live.live ? (
+              <p className="muted">
+                Abhi koi live frame nahi. Phone jab job chalayega to har step pe uski screen
+                yahan dikhegi (auto-refresh 5s).
+              </p>
+            ) : (
+              <>
+                <img
+                  key={live.live.updated_at}
+                  src={live.live.frame_url}
+                  alt="phone live screen"
+                  style={{ width: "100%", maxWidth: 340, borderRadius: 12, border: "1px solid #333" }}
+                />
+                <div style={{ marginTop: 10, fontSize: 14 }}>
+                  <b>{live.live.job_type || live.running_job?.type || "job"}</b>
+                  <div style={{ marginTop: 4 }}>📍 {live.live.current_step || live.running_job?.current_step || "…"}</div>
+                  <div className="muted" style={{ marginTop: 4 }}>
+                    frame: {timeAgo(live.live.updated_at)}
+                    {(Date.now() - new Date(live.live.updated_at).getTime() > 120000) && " ⚠️ stale — phone ka heartbeat ruka lagta hai"}
+                  </div>
+                </div>
+              </>
+            )}
+            {live?.running_job && (
+              <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
+                running job: <code>{live.running_job.id.slice(0, 8)}</code> · {live.running_job.steps_total} steps ·
+                heartbeat #{live.running_job.heartbeat_count}
+                {live.running_job.last_heartbeat ? ` · last ${timeAgo(live.running_job.last_heartbeat)}` : " · heartbeat abhi tak nahi"}
+              </div>
+            )}
+          </div>
+          <h3 style={{ marginTop: 18 }}>📜 History</h3>
+          {sortedJobs.length === 0 && <div className="card muted">Abhi tak koi job history nahi.</div>}
+          {sortedJobs.slice(0, 30).map(jobRow)}
+        </>
+      )}
+
       {tab === "jobs" && (
         <>
           {jobs.length === 0 && <div className="card muted">Koi job nahi — Campaigns tab se "Run Now" dabao.</div>}
-          {jobs.map((j) => (
-            <details className="job" key={j.id}>
-              <summary>
-                <span className={`badge ${j.status === "done" ? "green" : j.status === "failed" ? "red" : j.status === "running" ? "blue" : "grey"}`}>{j.status}</span>
-                <b>{j.type}</b>
-                <span className="muted">{j.steps.length} steps · {timeAgo(j.updated_at)}</span>
-              </summary>
-              <div className="body">
-                <div className="muted" style={{ fontSize: 12 }}>id: <code>{j.id}</code></div>
-                <pre className="logs">{JSON.stringify(j.result ?? { steps: j.steps.length, note: "no result yet" }, null, 2)}</pre>
-              </div>
-            </details>
-          ))}
+          {sortedJobs.map(jobRow)}
         </>
       )}
 
@@ -303,6 +441,15 @@ export default function Dashboard() {
             </div>
           ))}
           {devices.length === 0 && <div className="card muted">Koi device nahi — <a href="/connect">connect karo</a>.</div>}
+          <div className="card">
+            <h3 style={{ marginTop: 0 }}>🧹 Stuck-job recovery</h3>
+            <p className="muted" style={{ fontSize: 13 }}>
+              "running" job jiska heartbeat 10 minute se zyada purana hai, use dobara queue me daalo.
+            </p>
+            <button className="btn small ghost" disabled={busy === "stuck"} onClick={requeueStuck}>
+              {busy === "stuck" ? "…" : "🧹 Stuck jobs requeue karo"}
+            </button>
+          </div>
         </>
       )}
     </div>

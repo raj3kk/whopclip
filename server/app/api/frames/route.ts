@@ -3,7 +3,13 @@ import { getDevice } from "@/lib/store";
 
 /**
  * POST /api/frames — device frame upload (multipart/form-data).
- * Fields: device_id, job_id, key, frame (PNG file).
+ * Fields: device_id, job_id, key, frame (PNG file; JPEG when key is "live").
+ * Optional: job_type, current_step (used when key is "live").
+ *
+ * Special key "live": the phone uploads a downscaled JPEG WebView screenshot
+ * after every job step. The object is upserted (stable URL per job) and a
+ * live pointer is saved so GET /api/live can show the phone's current
+ * screen on the dashboard.
  *
  * The phone's JobEngine captures WebView screenshots during verify stages
  * and uploads them here. The route:
@@ -93,7 +99,12 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const objectPath = `frames/${safeSegment(device_id)}/${safeSegment(job_id)}/${safeSegment(key)}.png`;
+  // Live frames (key "live") are downscaled JPEGs the phone uploads after
+  // every job step; verify frames stay PNG. x-upsert overwrites the object
+  // so the live URL is stable per job.
+  const isLive = key === "live";
+  const ext = isLive ? "jpg" : "png";
+  const objectPath = `frames/${safeSegment(device_id)}/${safeSegment(job_id)}/${safeSegment(key)}.${ext}`;
   const bytes = Buffer.from(await file.arrayBuffer());
   const upload = await fetch(
     `${SB_URL}/storage/v1/object/${BUCKET}/${objectPath}`,
@@ -102,7 +113,7 @@ export async function POST(req: NextRequest) {
       headers: {
         apikey: SB_KEY,
         Authorization: `Bearer ${SB_KEY}`,
-        "Content-Type": "image/png",
+        "Content-Type": isLive ? "image/jpeg" : "image/png",
         "x-upsert": "true",
       },
       body: bytes,
@@ -117,5 +128,19 @@ export async function POST(req: NextRequest) {
   }
 
   const url = `${SB_URL}/storage/v1/object/public/${BUCKET}/${objectPath}`;
+
+  // Live pointer: the dashboard Live tab reads this to show "phone abhi
+  // kya kar raha hai" without scanning storage.
+  if (isLive) {
+    const { setLiveFrame } = await import("@/lib/store");
+    await setLiveFrame({
+      device_id,
+      job_id,
+      job_type: String(form.get("job_type") ?? ""),
+      current_step: String(form.get("current_step") ?? ""),
+      frame_url: url,
+    });
+  }
+
   return NextResponse.json({ ok: true, url, path: objectPath });
 }

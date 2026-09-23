@@ -12,8 +12,14 @@ BT="$SDK/build-tools/34.0.0"
 PLATFORM="$SDK/platforms/android-34/android.jar"
 KOTLINC="$HOME/workspace/.kotlin/kotlinc/bin/kotlinc"
 
-VERSION_CODE="${VERSION_CODE:-${1:-7}}"
-VERSION_NAME="${VERSION_NAME:-${2:-1.0.5}}"
+# Explicit positional args always beat ambient env: a stale exported
+# VERSION_CODE from an older build must never silently re-stamp a new one
+# (2026-09-23: `bash tools/build-apk.sh 14 1.0.12` built v7 because the
+# shell had VERSION_CODE=7 exported).
+if [ -n "${1:-}" ]; then VERSION_CODE="$1"; fi
+if [ -n "${2:-}" ]; then VERSION_NAME="$2"; fi
+VERSION_CODE="${VERSION_CODE:-7}"
+VERSION_NAME="${VERSION_NAME:-1.0.5}"
 APP_ID="com.whopclip.agent"
 echo "building versionCode=$VERSION_CODE versionName=$VERSION_NAME"
 
