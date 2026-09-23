@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyAuthToken, AUTH_COOKIE } from "@/lib/auth";
 import { checkAllSessions } from "@/lib/sessionCheck";
+import { listDevices } from "@/lib/store";
 
 /**
  * POST /api/sessions/check
- * Body: { device_id }
+ * Body: { device_id } — omit device_id (or "*") to check all paired devices.
  *
  * Server-side session health check: decrypts the saved Whop/Instagram
  * cookies and verifies each login is still valid with a lightweight
@@ -28,12 +29,16 @@ export async function POST(req: NextRequest) {
   }
   try {
     const body = await req.json();
-    const device_id = typeof body?.device_id === "string" ? body.device_id : "";
-    if (!device_id) {
-      return NextResponse.json({ error: "device_id required" }, { status: 400 });
+    const raw = typeof body?.device_id === "string" ? body.device_id : "";
+    const ids: string[] =
+      !raw || raw === "*"
+        ? (await listDevices()).map((d) => d.device_id)
+        : [raw];
+    const all: Record<string, unknown> = {};
+    for (const device_id of ids) {
+      all[device_id] = await checkAllSessions(device_id);
     }
-    const results = await checkAllSessions(device_id);
-    return NextResponse.json({ device_id, results });
+    return NextResponse.json({ devices: all });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "unknown";
     return NextResponse.json({ error: msg }, { status: 500 });
