@@ -80,6 +80,8 @@ export async function POST(req: NextRequest) {
   for (const [name, path] of [
     ["listSubmissions", "/api/submission/submissions?limit=5"],
     ["listDrafts", "/api/submission/submission-drafts?limit=5"],
+    ["applicationsMe", "/api/campaign/campaigns/applications/me"],
+    ["userMe", "/api/user/me"],
   ] as const) {
     try {
       const res = await crFetch(path, {
