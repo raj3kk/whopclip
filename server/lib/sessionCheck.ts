@@ -132,6 +132,18 @@ async function probeWhop(
           detail: `landed on ${host.slice(0, 40)} (${(low.length / 1024).toFixed(0)}kb, ${hops} redirect${hops === 1 ? "" : "s"})`,
         };
       }
+      // Bounced from an authenticated URL all the way to the marketing
+      // homepage ("/") = cookies not authenticating. Whop never bounces a
+      // logged-in user from /dashboard/ to the public homepage.
+      const atRoot = host === "/" || host === "";
+      const hasLoginCta =
+        low.includes("log in") || low.includes("sign up") || low.includes("get started");
+      if (atRoot && hasLoginCta && hops > 0) {
+        return {
+          valid: false,
+          detail: `bounced to public homepage after ${hops} redirect${hops === 1 ? "" : "s"} — not authenticated`,
+        };
+      }
       return {
         valid: null,
         detail: `landed on ${host.slice(0, 60)} — ambiguous content`,
