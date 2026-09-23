@@ -102,6 +102,11 @@ export async function POST(req: NextRequest) {
         const j = JSON.parse(text) as { code?: string; error?: string };
         code = j.code ?? j.error ?? null;
       } catch { /* non-JSON */ }
+      const headers: Record<string, string> = {};
+      for (const h of ["server", "cf-ray", "www-authenticate", "set-cookie", "content-type", "x-request-id"]) {
+        const v = res.headers.get(h);
+        if (v) headers[h] = h === "set-cookie" ? "<present>" : v.slice(0, 120);
+      }
       // Count items without returning content
       let count: number | null = null;
       try {
@@ -114,7 +119,7 @@ export async function POST(req: NextRequest) {
           else if (Array.isArray(o.submissions)) count = o.submissions.length;
         }
       } catch { /* ignore */ }
-      out[name] = { status: res.status, ok: res.ok, code, count };
+      out[name] = { status: res.status, ok: res.ok, code, count, headers };
     } catch (e) {
       out[name] = { status: -1, ok: false, code: e instanceof Error ? e.message : "net" };
     }
