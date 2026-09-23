@@ -41,9 +41,6 @@ export async function GET(
       device_model: d.device_model,
       jobs_today: String(jobsToday),
       earnings,
-      // TEMP build marker (2026-09-23): proves which deployment served this
-      // route while diagnosing the frozen-status read path. REMOVE after fix.
-      build: "no-store+fd-20260923",
     },
     { headers: { "Cache-Control": "no-store" } }
   );
