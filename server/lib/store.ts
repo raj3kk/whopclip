@@ -32,6 +32,9 @@ export interface Session {
   stale: boolean;
   created_at: string;
   updated_at: string;
+  /** v20+: cookie name -> capture domain (e.g. "contentrewards.com"). Lets the
+   *  dashboard show cookies category-wise (Whop vs Content Rewards). */
+  cookie_domains?: Record<string, string>;
 }
 
 export interface Requirements {

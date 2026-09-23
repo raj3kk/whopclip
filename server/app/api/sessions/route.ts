@@ -58,21 +58,30 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { device_id, service, cookies, user_agent, device_model, account } = body ?? {};
+    const { device_id, service, cookies, user_agent, device_model, account, domains } = body ?? {};
     if (!device_id || (service !== "whop" && service !== "instagram") || !cookies) {
       return NextResponse.json({ error: "device_id, service, cookies required" }, { status: 400 });
     }
     const existing = await getSession(device_id, service as ServiceName);
     let merged: Record<string, string> = {};
+    let mergedDomains: Record<string, string> = {};
     if (existing) {
       try {
         merged = JSON.parse(decryptSession(existing.encrypted)) as Record<string, string>;
       } catch {
         merged = {};
       }
+      mergedDomains = { ...(existing.cookie_domains ?? {}) };
     }
     for (const [k, v] of Object.entries(cookies as Record<string, unknown>)) {
       if (k && typeof v === "string" && v !== "") merged[k] = v;
+    }
+    // v20+: optional per-cookie capture domains (name -> domain) for the
+    // category-wise Sessions view. Only non-empty string values accepted.
+    if (domains && typeof domains === "object") {
+      for (const [k, v] of Object.entries(domains as Record<string, unknown>)) {
+        if (k && typeof v === "string" && v !== "") mergedDomains[k] = v.slice(0, 64);
+      }
     }
     const encrypted = encryptSession(JSON.stringify(merged));
     const now = new Date().toISOString();
@@ -86,6 +95,7 @@ export async function POST(req: NextRequest) {
       stale: false,
       created_at: existing?.created_at ?? now,
       updated_at: now,
+      cookie_domains: mergedDomains,
     });
     return NextResponse.json({ ok: true, service, merged_cookie_count: Object.keys(merged).length });
   } catch (e: unknown) {

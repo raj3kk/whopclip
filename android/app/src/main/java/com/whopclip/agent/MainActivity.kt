@@ -120,6 +120,10 @@ class MainActivity : Activity() {
 
         showTab(2) // start on Profile so pairing state is obvious
         refreshProfile()
+        // v20: cookie auto-sync — app khulne pe har 1 min me IG/Whop/Content
+        // Rewards ke valid cookies server pe sync honge. "Session save" tap ki
+        // zaroorat nahi; login hote hi agli sync me session server pe pahunch jayega.
+        CookieSyncService.start(this)
         // AutoClip-style auto-start: agar user ne automation ON chhoda tha
         // (paired + online + logins), to app khulne pe background automation
         // khud shuru ho jaye — dobara Online dabane ka wait nahi.

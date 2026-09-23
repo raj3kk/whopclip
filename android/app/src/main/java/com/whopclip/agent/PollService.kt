@@ -144,6 +144,12 @@ class BootReceiver : BroadcastReceiver() {
         val action = intent.action
         if (action != Intent.ACTION_BOOT_COMPLETED &&
             action != Intent.ACTION_MY_PACKAGE_REPLACED) return
+        // v20: cookie auto-sync bhi re-arm karo (paired device pe hamesha).
+        if (SessionManager.isPaired(ctx)) {
+            try { CookieSyncService.start(ctx) } catch (t: Throwable) {
+                android.util.Log.w("BootReceiver", "cookie sync start blocked", t)
+            }
+        }
         // Respect the user's choice: only auto-start if they left it ONLINE.
         if (!SessionManager.isPaired(ctx) || !SessionManager.isOnline(ctx)) {
             android.util.Log.i("BootReceiver", "was offline — not auto-starting")

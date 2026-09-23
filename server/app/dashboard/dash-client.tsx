@@ -82,6 +82,26 @@ export default function Dashboard() {
   const [earned, setEarned] = useState(0);
   const [pending, setPending] = useState(0);
   const [sessions, setSessions] = useState<Record<string, { linked: boolean; stale: boolean }> | null>(null);
+  const [sessionView, setSessionView] = useState<{
+    device_id: string;
+    services: Record<string, {
+      linked: boolean; stale?: boolean; account?: string; updated_at?: string;
+      total_cookies?: number;
+      categories?: Array<{
+        key: string; title: string; domain: string;
+        cookies: Array<{ name: string; preview: string; length: number; jwt: { exp: string; expired: boolean } | null; looks_expired_jwt: boolean }>;
+      }>;
+    }>;
+  } | null>(null);
+
+  const loadSessions = useCallback(async (sel?: string) => {
+    const id = sel ?? deviceId;
+    if (!id) return;
+    setBusy("sessions");
+    const r = await jget(`/api/sessions/view?device_id=${encodeURIComponent(id)}`);
+    if (r.ok) setSessionView(r.j as typeof sessionView);
+    setBusy(null);
+  }, [deviceId]);
   const [schedTime, setSchedTime] = useState("09:00");
   const [schedOn, setSchedOn] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -355,9 +375,9 @@ export default function Dashboard() {
       )}
 
       <div className="tabs">
-        {(["campaigns", "chains", "live", "jobs", "earnings", "phone"] as const).map((t) => (
-          <button key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-            {t === "campaigns" ? "🎯 Campaigns" : t === "chains" ? `⛓️ Chains (${chains.length})` : t === "live" ? "🔴 Live" : t === "jobs" ? `⚙️ Jobs (${jobs.filter((j) => j.status === "queued" || j.status === "running").length})` : t === "earnings" ? `💰 Earnings ($${earned.toFixed(2)})` : "📱 Phone"}
+        {(["campaigns", "chains", "live", "jobs", "earnings", "sessions", "phone"] as const).map((t) => (
+          <button key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => { setTab(t); if (t === "sessions") loadSessions(); }}>
+            {t === "campaigns" ? "🎯 Campaigns" : t === "chains" ? `⛓️ Chains (${chains.length})` : t === "live" ? "🔴 Live" : t === "jobs" ? `⚙️ Jobs (${jobs.filter((j) => j.status === "queued" || j.status === "running").length})` : t === "earnings" ? `💰 Earnings ($${earned.toFixed(2)})` : t === "sessions" ? "🔐 Sessions" : "📱 Phone"}
           </button>
         ))}
       </div>
@@ -645,6 +665,81 @@ export default function Dashboard() {
             </table>
             {subs.length === 0 && <p className="muted">Abhi koi submission nahi.</p>}
           </div>
+        </>
+      )}
+
+      {tab === "sessions" && (
+        <>
+          <div className="card">
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <h3 style={{ margin: 0 }}>🔐 Sessions — phone se auto-sync cookies</h3>
+              <button className="btn small" disabled={busy === "sessions"} onClick={() => loadSessions()}>
+                {busy === "sessions" ? "…" : "↻ Refresh"}
+              </button>
+            </div>
+            <p className="muted" style={{ fontSize: 13 }}>
+              App har 1 minute me Instagram, Whop aur Content Rewards ke <b>sirf valid</b> cookies
+              server pe sync karta hai (khud — “Session save” dabane ki zaroorat nahi).
+              Yahan sirf cookie <b>names + masked preview</b> dikhte hain, poori values kabhi nahi.
+            </p>
+          </div>
+          {!sessionView && <div className="card muted">Loading…</div>}
+          {sessionView && (["whop", "instagram"] as const).map((svc) => {
+            const s = sessionView.services[svc];
+            if (!s) return null;
+            return (
+              <div className="card" key={svc}>
+                <h3 style={{ marginTop: 0 }}>
+                  {svc === "whop" ? "🛍️ Whop + Content Rewards" : "📸 Instagram"}
+                  {" "}
+                  {s.linked
+                    ? <span className={`badge ${s.stale ? "yellow" : "green"}`}>{s.stale ? "stale" : "linked"}</span>
+                    : <span className="badge red">not linked</span>}
+                </h3>
+                {s.linked && (
+                  <div className="muted" style={{ fontSize: 13, marginBottom: 10 }}>
+                    {s.total_cookies} cookies · last sync {timeAgo(s.updated_at ?? null)}
+                    {s.account ? <> · account: <b>{s.account}</b></> : null}
+                  </div>
+                )}
+                {s.linked && (s.categories ?? []).map((cat) => (
+                  <div key={cat.key} style={{ marginBottom: 12 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 6 }}>
+                      {cat.title} <span className="muted" style={{ fontWeight: 400, fontSize: 12 }}>
+                        {cat.cookies.length} cookies{cat.domain ? ` · ${cat.domain}` : ""}
+                      </span>
+                    </div>
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+                        <thead><tr style={{ textAlign: "left", borderBottom: "1px solid #ddd" }}>
+                          <th>Cookie</th><th>Value (masked)</th><th>Len</th><th>Expiry</th>
+                        </tr></thead>
+                        <tbody>
+                          {cat.cookies.map((c) => (
+                            <tr key={c.name} style={{ borderBottom: "1px solid #eee" }}>
+                              <td><code>{c.name}</code></td>
+                              <td><code>{c.preview}</code></td>
+                              <td>{c.length}</td>
+                              <td>
+                                {c.jwt
+                                  ? <span className={`badge ${c.looks_expired_jwt ? "red" : "green"}`}>
+                                      {c.looks_expired_jwt ? "expired" : "valid"} · {new Date(c.jwt.exp).toLocaleDateString()}
+                                    </span>
+                                  : <span className="muted">—</span>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ))}
+                {s.linked && (s.categories ?? []).length === 0 && (
+                  <div className="muted" style={{ fontSize: 13 }}>Koi cookie nahi — app me login karo, auto-sync 1 min me utha lega.</div>
+                )}
+              </div>
+            );
+          })}
         </>
       )}
 
