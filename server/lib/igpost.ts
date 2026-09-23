@@ -165,9 +165,14 @@ async function bootstrapClient(device_id: string): Promise<{ ig: any; errors: Re
 
   const ig = new IgApiClient();
   // Restore persisted device fingerprint (generate ONCE per account).
+  // CRITICAL: We must do a SINGLE deserialize with the merged state.
+  // The old code did deserialize(saved) then deserialize({cookies}) —
+  // the second call WIPED the device fingerprint, causing Instagram
+  // to see a new device on every pump (auth failures / checkpoints).
+  let stateToRestore: Record<string, unknown> | null = null;
   const saved = (await kv.get(stateKey(device_id))) as Record<string, unknown> | null;
-  if (saved && typeof saved === "object" && saved.cookies) {
-    await ig.state.deserialize(saved);
+  if (saved && typeof saved === "object" && (saved as any).cookies) {
+    stateToRestore = saved;
   } else {
     let username = "instagram_user";
     try {
@@ -178,10 +183,12 @@ async function bootstrapClient(device_id: string): Promise<{ ig: any; errors: Re
       /* keep fallback */
     }
     ig.state.generateDevice(username);
+    stateToRestore = (await ig.state.serialize()) as Record<string, unknown>;
   }
-  // Inject the phone-harvested WEB cookies. Domain=.instagram.com is
-  // essential: the library talks to i.instagram.com, a host-only
-  // www.instagram.com cookie would never be sent.
+  // Inject the phone-harvested WEB cookies into the state, preserving
+  // the device fingerprint. Domain=.instagram.com is essential: the
+  // library talks to i.instagram.com, a host-only www.instagram.com
+  // cookie would never be sent.
   const jar = new CookieJar();
   for (const [k, v] of Object.entries(cookies)) {
     if (!k || v == null || v === "") continue;
@@ -191,7 +198,11 @@ async function bootstrapClient(device_id: string): Promise<{ ig: any; errors: Re
       /* skip malformed */
     }
   }
-  await ig.state.deserialize({ cookies: jar.serializeSync() });
+  // Merge: keep device fingerprint + all state, replace ONLY the cookies.
+  await ig.state.deserialize({
+    ...stateToRestore,
+    cookies: jar.serializeSync(),
+  });
 
   // Validate the session without any password login.
   try {

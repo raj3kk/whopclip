@@ -5,7 +5,7 @@ import { verifyAuthToken, AUTH_COOKIE } from "@/lib/auth";
 /**
  * POST /api/run (owner login)
  * Body: { device_id, step: "full"|"discover"|"check"|"join"|"render"|"post"|"verify"|"submit",
- *         campaign_id?, caption?, video_url?, ig_post_url?, discover_url?, brief_text? }
+ *         campaign_id?, caption?, video_url?, cover_url?, ig_post_url?, discover_url?, brief_text? }
  *
  * Enqueues real JobEngine step templates for the phone (see lib/run.ts).
  * "render" is server-side: it parses brief_text and enqueues a VM render spec.
@@ -22,6 +22,7 @@ export async function POST(req: NextRequest) {
       campaign_id: body?.campaign_id,
       caption: body?.caption,
       video_url: body?.video_url,
+      cover_url: body?.cover_url,
       ig_post_url: body?.ig_post_url,
       discover_url: body?.discover_url,
       brief_text: body?.brief_text,
