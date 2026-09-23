@@ -2,25 +2,24 @@ package com.whopclip.agent
 
 import android.content.Context
 import android.util.Log
-import androidx.work.Configuration
 import androidx.work.WorkManager
 
 /**
- * Lazy WorkManager access — AutoClip-style (Scheduler.ensureInitialized).
+ * Lazy WorkManager access — v13: auto-init via androidx.startup.
  *
- * ROOT CAUSE of the v11 "WorkManager start nahi hua — dobara try karo"
- * dead-end: the old ensure() called WorkManager.initialize() BLINDLY on
- * every call. initialize() throws IllegalStateException("WorkManager is
- * already initialized") when WorkManager is already up in this process.
- * The exception was swallowed, ensure() returned false FOREVER, and the
- * Online button could never start automation no matter how many times the
- * user tapped it.
+ * v12 HISTORY: manual WorkManager.initialize() hit an on-device
+ * NoClassDefFoundError ("Failed resolution") that exhaustive static dex
+ * analysis could NOT explain — all 407 work-runtime classes, Room/SQLite/
+ * Guava/startup/Kotlin-FunctionN, and Room's generated _Impl classes are
+ * present in the dex. Root cause of the v11 dead-end was the blind
+ * initialize() + swallowed IllegalStateException; v12 surfaced the real
+ * error but manual init stayed broken on-device.
  *
- * Fixed pattern: ask for getInstance() FIRST; call initialize() only when
- * it throws IllegalStateException (genuinely not initialized yet). Every
- * path that ends with a usable WorkManager returns true. The last failure
- * is kept in [lastError] and surfaced in the UI, so a failure is never a
- * mystery again.
+ * v13 FIX: use the OFFICIAL init path — androidx.startup.InitializationProvider
+ * (declared in AndroidManifest) auto-initializes WorkManager at process
+ * start via WorkManagerInitializer. No manual initialize() call anywhere.
+ * ensure() now only asks getInstance(); if auto-init failed, the error is
+ * reported instead of retrying a broken manual path.
  *
  * Call [ensure] only from a user action ("Online"), from PollService, or
  * from BootReceiver — never from Application.onCreate / Activity.onCreate.
@@ -34,53 +33,19 @@ object WorkHelper {
 
     /**
      * True when WorkManager is usable in this process. Never throws.
-     * Thread-safe: a lost init race is detected and recovered via the
-     * verification getInstance() below.
+     * Relies on androidx.startup auto-init (see AndroidManifest).
      */
     fun ensure(ctx: Context): Boolean {
-        // 1) Already up? Done — also covers "someone else initialized it".
-        try {
-            WorkManager.getInstance(ctx)
-            lastError = ""
-            return true
-        } catch (e: IllegalStateException) {
-            // Genuinely not initialized yet — fall through and init below.
-            Log.i(TAG, "WorkManager not initialized yet — initializing now")
-        } catch (t: Throwable) {
-            lastError = "getInstance: ${t.javaClass.simpleName}: ${t.message}"
-            Log.e(TAG, "WorkManager.getInstance failed", t)
-            return false
-        }
-        // 2) Lazy manual init (no androidx.startup provider in the manifest).
-        try {
-            WorkManager.initialize(
-                ctx.applicationContext,
-                Configuration.Builder()
-                    .setMinimumLoggingLevel(Log.INFO)
-                    .build()
-            )
-        } catch (t: Throwable) {
-            // 3) Lost a race (initialized between our check and init)?
-            //    Verify before giving up.
-            try {
-                WorkManager.getInstance(ctx)
-                lastError = ""
-                Log.i(TAG, "WorkManager became available during init race")
-                return true
-            } catch (_: Throwable) { }
-            lastError = "initialize: ${t.javaClass.simpleName}: ${t.message}"
-            Log.e(TAG, "lazy WorkManager init failed", t)
-            return false
-        }
-        // 4) Verify the init actually took.
         return try {
             WorkManager.getInstance(ctx)
             lastError = ""
-            Log.i(TAG, "WorkManager initialized lazily")
             true
         } catch (t: Throwable) {
-            lastError = "verify: ${t.javaClass.simpleName}: ${t.message}"
-            Log.e(TAG, "WorkManager init did not take", t)
+            // Auto-init did not happen (provider missing/disabled) or failed.
+            // Do NOT attempt manual initialize() — v12 proved that path
+            // throws NoClassDefFoundError on-device.
+            lastError = "getInstance: ${t.javaClass.simpleName}: ${t.message}"
+            Log.e(TAG, "WorkManager.getInstance failed (auto-init missing?)", t)
             false
         }
     }
