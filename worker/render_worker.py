@@ -245,30 +245,31 @@ def extract_cover(clip_path, clip_dur, dest):
 
 
 def upload_catbox(path):
-    """Free anonymous upload (no key). Returns the public https URL."""
-    import http.client
-    import mimetypes
-    boundary = "----wcboundary" + str(int(time.time() * 1000))
-    fname = os.path.basename(path)
-    ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
-    with open(path, "rb") as f:
-        data = f.read()
-    if len(data) > 190 * 1024 * 1024:
+    """Free anonymous upload (no key). Returns the public https URL.
+    Uses curl: the hand-rolled http.client multipart got its connection
+    closed by catbox twice (2026-09-23) while curl -F worked."""
+    import subprocess
+    size = os.path.getsize(path)
+    if size > 190 * 1024 * 1024:
         raise RuntimeError("file too large for catbox (190MB cap)")
-    body = (
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n"
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"fileToUpload\"; "
-        f"filename=\"{fname}\"\r\nContent-Type: {ctype}\r\n\r\n"
-    ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
-    conn = http.client.HTTPSConnection("catbox.moe", timeout=180)
-    conn.request("POST", "/user/api.php", body,
-                 {"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    resp = conn.getresponse()
-    text = resp.read().decode().strip()
-    if resp.status != 200 or not text.startswith("https://"):
-        raise RuntimeError(f"catbox upload failed: HTTP {resp.status} {text[:120]}")
-    log("uploaded:", text)
-    return text
+    for attempt in (1, 2, 3):
+        try:
+            out = subprocess.run(
+                ["curl", "-sS", "-m", "120", "-F", "reqtype=fileupload",
+                 "-F", f"fileToUpload=@{path}",
+                 "https://catbox.moe/user/api.php"],
+                capture_output=True, text=True, timeout=150,
+            )
+            text = (out.stdout or "").strip()
+            if out.returncode == 0 and text.startswith("https://"):
+                log("uploaded:", text)
+                return text
+            last = (out.stderr or text)[:120]
+        except Exception as e:
+            last = str(e)[:120]
+        log(f"catbox attempt {attempt} failed: {last}")
+        time.sleep(5 * attempt)
+    raise RuntimeError(f"catbox upload failed 3x: {last}")
 
 
 def process_spec(spec, dry_run=False):
