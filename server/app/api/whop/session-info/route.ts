@@ -13,11 +13,18 @@ function jwtExp(v: string): { exp: string; expired: boolean; iat: string } | nul
   try {
     if (v.split(".").length !== 3) return null;
     const p = JSON.parse(Buffer.from(v.split(".")[1], "base64").toString());
+    // Return non-secret claims only: drop any claim whose VALUE looks like a token/secret.
+    const safe: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(p)) {
+      if (typeof val === "string" && val.length > 60) safe[k] = `<str len ${val.length}>`;
+      else safe[k] = val;
+    }
     return {
       exp: new Date(p.exp * 1000).toISOString(),
       expired: p.exp * 1000 < Date.now(),
       iat: new Date(p.iat * 1000).toISOString(),
-    };
+      claims: safe,
+    } as unknown as { exp: string; expired: boolean; iat: string };
   } catch {
     return null;
   }
