@@ -84,17 +84,21 @@ export async function POST(req: NextRequest) {
         ? String(jar["whop-core.uid-token"] ?? "")
         : undefined;
   const out: Record<string, unknown> = { authMode };
-  for (const [name, path] of [
-    ["listSubmissions", "/api/submission/submissions?limit=5"],
-    ["listDrafts", "/api/submission/submission-drafts?limit=5"],
-    ["applicationsMe", "/api/campaign/campaigns/applications/me"],
-    ["userMe", "/api/user/me"],
+  for (const [name, path, method, json] of [
+    ["listSubmissions", "/api/submission/submissions?limit=5", "GET", undefined],
+    ["listDrafts", "/api/submission/submission-drafts?limit=5", "GET", undefined],
+    ["applicationsMe", "/api/campaign/campaigns/applications/me", "GET", undefined],
+    ["userMe", "/api/user/me", "GET", undefined],
+    ["authSession", "/api/auth/authenticate/session", "GET", undefined],
+    ["authorizeResolve", "/api/auth/authorize/resolve", "POST", {}],
   ] as const) {
     try {
       const res = await crFetch(path, {
+        method,
         cookieHeader,
         referer: "https://contentrewards.com/discover",
         bearer,
+        ...(json !== undefined ? { json } : {}),
       });
       const text = await res.text().catch(() => "");
       let code: string | null = null;
