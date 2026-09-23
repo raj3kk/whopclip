@@ -9,9 +9,12 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
@@ -21,12 +24,22 @@ import java.util.concurrent.TimeUnit
 /**
  * Foreground service that keeps the job poller alive, plus a
  * WorkManager periodic backup so polling survives process death.
+ *
+ * v12 automation model (AutoClip-style):
+ * - startAutomation(): ONE entry point — foreground service (persistent
+ *   notification) + immediate worker run NOW + durable 15-min periodic
+ *   backbone. Used by the Online button AND by app-launch auto-start.
+ * - The periodic work requires CONNECTED network: phone offline ho to
+ *   WorkManager wait karta hai, network wapas aate hi worker khud chal
+ *   padta hai ("mobile online aye → automatic background me chalne lage").
  */
 class PollService : Service() {
     companion object {
         const val CHANNEL_ID = "whopclip_poll"
         const val NOTIF_ID = 1001
         const val WORK_NAME = "whopclip-poll"
+        const val WORK_NOW_NAME = "whopclip-poll-now"
+        private const val TAG = "PollService"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, PollService::class.java)
@@ -34,37 +47,62 @@ class PollService : Service() {
             else ctx.startService(i)
         }
 
-        /** Real stop: kills the foreground service + cancels periodic work. */
+        /** Real stop: kills the foreground service + cancels all work. */
         fun stop(ctx: Context) {
             try { ctx.stopService(Intent(ctx, PollService::class.java)) } catch (_: Exception) { }
-            try {
-                if (WorkHelper.isReady(ctx))
-                    WorkManager.getInstance(ctx).cancelUniqueWork(WORK_NAME)
-            } catch (_: Exception) { }
-        }
-
-        fun schedulePeriodic(ctx: Context) {
-            // Lazy init: Application no longer touches WorkManager at launch.
-            if (!WorkHelper.ensure(ctx)) return
-            val req = PeriodicWorkRequestBuilder<PollWorker>(15, TimeUnit.MINUTES).build()
-            WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(
-                WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, req
-            )
+            WorkHelper.cancel(ctx)
         }
 
         /**
-         * One-shot expedited run — used after boot on Android 12+, where a
-         * direct startForegroundService() from the background is blocked.
-         * The worker promotes itself to foreground (notification) via
-         * setForeground(), which IS allowed from the background.
+         * Full automation start — the single entry point. Returns false only
+         * when WorkManager itself is unusable (error in WorkHelper.lastError).
          */
-        fun scheduleExpedited(ctx: Context) {
+        fun startAutomation(ctx: Context): Boolean {
+            if (!WorkHelper.ensure(ctx)) {
+                Log.e(TAG, "startAutomation: WorkManager unusable: ${WorkHelper.lastError}")
+                return false
+            }
+            return try {
+                start(ctx)            // foreground service + persistent notification
+                runNow(ctx)           // immediate PollWorker run — automation starts NOW
+                schedulePeriodic(ctx) // durable 15-min backbone
+                Log.i(TAG, "automation started (service + immediate run + periodic)")
+                true
+            } catch (t: Throwable) {
+                Log.e(TAG, "startAutomation failed", t)
+                false
+            }
+        }
+
+        /**
+         * One immediate PollWorker run. `name` separates user taps / launch
+         * auto-start from boot re-arming so they don't cancel each other.
+         */
+        fun runNow(ctx: Context, name: String = WORK_NOW_NAME) {
             if (!WorkHelper.ensure(ctx)) return
             val req = OneTimeWorkRequestBuilder<PollWorker>()
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .build()
             WorkManager.getInstance(ctx).enqueueUniqueWork(
-                "$WORK_NAME-boot", ExistingWorkPolicy.KEEP, req
+                name, ExistingWorkPolicy.REPLACE, req
+            )
+        }
+
+        fun schedulePeriodic(ctx: Context) {
+            // Lazy init: Application no longer touches WorkManager at launch.
+            if (!WorkHelper.ensure(ctx)) return
+            // CONNECTED constraint: network wapas aate hi WorkManager worker
+            // khud chala dega — no manual retry needed.
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+            val req = PeriodicWorkRequestBuilder<PollWorker>(15, TimeUnit.MINUTES)
+                .setConstraints(constraints)
+                .build()
+            // UPDATE (not KEEP): purani bina-constraint wali periodic work ko
+            // nayi constraint wali se replace karo.
+            WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(
+                WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, req
             )
         }
     }
@@ -120,9 +158,9 @@ class BootReceiver : BroadcastReceiver() {
         } catch (t: Throwable) {
             android.util.Log.w("BootReceiver",
                 "foreground start blocked (${t.javaClass.simpleName}) — using expedited work")
-            try { PollService.scheduleExpedited(ctx) } catch (_: Throwable) { }
         }
-        // Durable backbone on every version.
+        // Immediate run + durable backbone on every version.
+        try { PollService.runNow(ctx, "${PollService.WORK_NAME}-boot") } catch (_: Throwable) { }
         try { PollService.schedulePeriodic(ctx) } catch (_: Throwable) { }
     }
 }

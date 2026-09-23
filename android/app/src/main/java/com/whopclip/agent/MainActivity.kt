@@ -114,6 +114,39 @@ class MainActivity : Activity() {
 
         showTab(2) // start on Profile so pairing state is obvious
         refreshProfile()
+        // AutoClip-style auto-start: agar user ne automation ON chhoda tha
+        // (paired + online + logins), to app khulne pe background automation
+        // khud shuru ho jaye — dobara Online dabane ka wait nahi.
+        // Offline choice ka poora samman: saved offline = kuch shuru nahi.
+        autoStartAutomationIfOnline()
+    }
+
+    /**
+     * AutoClip behavior (startAutomationIfAllowed): app launch pe saved
+     * ONLINE state mili to automation apne aap background me shuru —
+     * foreground service + turant worker run + periodic backbone.
+     * Bilkul silent nahi: user ko toast se pata chalta hai.
+     */
+    private fun autoStartAutomationIfOnline() {
+        if (!SessionManager.isPaired(this) || !SessionManager.isOnline(this)) return
+        if (!SessionManager.isWhopLinked(this) || !SessionManager.isIgLinked(this)) return
+        CoroutineScope(Dispatchers.IO).launch {
+            val ok = PollService.startAutomation(this@MainActivity)
+            android.util.Log.i("MainActivity", "launch auto-start automation: $ok")
+            if (ok) postPresence(true) // server ko batao device online hai
+            withContext(Dispatchers.Main) {
+                if (ok) Toast.makeText(this@MainActivity,
+                    "Background automation auto-start ho gaya ✓",
+                    Toast.LENGTH_SHORT).show()
+                else {
+                    val why = WorkHelper.lastError.ifBlank { "unknown error" }
+                    Toast.makeText(this@MainActivity,
+                        "Auto-start fail: $why", Toast.LENGTH_LONG).show()
+                }
+                refreshProfile()
+                refreshLive()
+            }
+        }
     }
 
     override fun onResume() {
@@ -334,10 +367,16 @@ class MainActivity : Activity() {
     private fun refreshLive() {
         val online = SessionManager.isOnline(this)
         val paired = SessionManager.isPaired(this)
+        // WorkManager diagnostic line: failure kabhi silent nahi.
+        val wmLine = when {
+            WorkHelper.isReady(this) -> "WorkManager: ready ✓"
+            WorkHelper.lastError.isNotBlank() -> "WorkManager: FAILED — ${WorkHelper.lastError}"
+            else -> "WorkManager: not started"
+        }
         liveStatusText.text = when {
-            !paired -> "Status: not connected"
-            online -> "Status: ● ONLINE — automation chal raha hai"
-            else -> "Status: ○ OFFLINE — automation ruka hai"
+            !paired -> "Status: not connected\n$wmLine"
+            online -> "Status: ● ONLINE — automation chal raha hai\n$wmLine"
+            else -> "Status: ○ OFFLINE — automation ruka hai\n$wmLine"
         }
         // Current job from JobEngine's in-memory tracker, else server.
         val cur = JobEngine.currentJobInfo()
@@ -566,8 +605,11 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Real online/offline mechanism: tells the server this device's
-     * availability, and starts/stops the local poll worker to match.
+     * Real online/offline mechanism: local automation start/stop, saved
+     * state, and server presence — is order me taaki saved state hamesha
+     * reality bataye. v12: single PollService.startAutomation() entry point
+     * (foreground service + turant worker run + periodic backbone), aur
+     * failure pe ASLI error toast me — "dobara try karo" wala andhera nahi.
      */
     private fun setOnline(online: Boolean) {
         if (!SessionManager.isPaired(this)) {
@@ -580,23 +622,32 @@ class MainActivity : Activity() {
             return
         }
         CoroutineScope(Dispatchers.Main).launch {
-            val serverOk = postPresence(online)
             if (online) {
-                if (!WorkHelper.ensure(this@MainActivity)) {
+                // Pehle local automation — fail hua to online state save hi
+                // nahi hogi (server ko jhoothi online presence nahi).
+                val started = withContext(Dispatchers.IO) {
+                    PollService.startAutomation(this@MainActivity)
+                }
+                if (!started) {
+                    val why = WorkHelper.lastError.ifBlank { "unknown error" }
+                    android.util.Log.e("MainActivity", "automation start failed: $why")
                     Toast.makeText(this@MainActivity,
-                        "WorkManager start nahi hua — dobara try karo", Toast.LENGTH_LONG).show()
+                        "Automation start nahi hua: $why",
+                        Toast.LENGTH_LONG).show()
+                    refreshLive()
                     return@launch
                 }
-                PollService.start(this@MainActivity)
                 SessionManager.setOnline(this@MainActivity, true)
+                val serverOk = postPresence(true)
                 Toast.makeText(this@MainActivity,
-                    if (serverOk) "Online ✓ — automation chal raha hai"
-                    else "Online (local) — server sync fail, net check karo",
+                    if (serverOk) "Online ✓ — background automation chal raha hai"
+                    else "Online ✓ (local) — server sync fail, net check karo",
                     Toast.LENGTH_SHORT).show()
             } else {
                 PollService.stop(this@MainActivity)
                 WorkHelper.cancel(this@MainActivity)
                 SessionManager.setOnline(this@MainActivity, false)
+                val serverOk = postPresence(false)
                 Toast.makeText(this@MainActivity,
                     if (serverOk) "Offline ✓ — automation ruk gaya"
                     else "Offline (local) — server sync fail",
