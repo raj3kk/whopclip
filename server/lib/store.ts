@@ -436,7 +436,7 @@ export async function requeueStuckJobs(
     const last = job.last_heartbeat ?? job.updated_at;
     if (now - new Date(last).getTime() < staleAfterMs) continue;
     if (job.cancel_requested) {
-      // Owner ne cancel manga tha — ise dobara zinda mat karo. Phone ne
+      // Owner ne cancel manga tha — ise dobara zinda mat karo. (fix 2026-09-23)
       // heartbeat nahi bheja (offline/mara hua), to server-side hi cancelled
       // finalize karo taaki ye kabhi claim na ho.
       job.status = "cancelled";
