@@ -748,6 +748,21 @@ export async function markChainPosted(
  * server-side HTML scrape is blocked by Instagram's datacenter-IP
  * restrictions but the live post was verified in-browser.
  */
+/**
+ * Resurrect a chain that failed at submit (e.g. after the Whop session
+ * was refreshed) back to submit/active for another attempt.
+ */
+export async function retryChainSubmit(chain_id: string): Promise<Chain | null> {
+  const chain = await getChain(chain_id);
+  if (!chain) return null;
+  if (chain.stage !== "submit" || !chain.ig_post_url) return chain;
+  chain.status = "active";
+  chain.attempts = 0;
+  chain.error = null;
+  await saveChain(chain);
+  return chain;
+}
+
 export async function markChainVerified(chain_id: string): Promise<Chain | null> {
   const chain = await getChain(chain_id);
   if (!chain) return null;
