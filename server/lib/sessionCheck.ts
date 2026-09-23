@@ -133,17 +133,10 @@ async function probeWhop(
         };
       }
       // Bounced from an authenticated URL all the way to the marketing
-      // homepage ("/") = cookies not authenticating. Whop never bounces a
-      // logged-in user from /dashboard/ to the public homepage.
-      const atRoot = host === "/" || host === "";
-      const hasLoginCta =
-        low.includes("log in") || low.includes("sign up") || low.includes("get started");
-      if (atRoot && hasLoginCta && hops > 0) {
-        return {
-          valid: false,
-          detail: `bounced to public homepage after ${hops} redirect${hops === 1 ? "" : "s"} — not authenticated`,
-        };
-      }
+      // homepage ("/") with login CTAs is a strong logged-out signal, BUT
+      // Whop's datacenter behavior is erratic (timeouts, variant pages), so
+      // we stay conservative: homepage landing = inconclusive, never stale.
+      // Only an explicit login-page bounce or login-page content marks stale.
       return {
         valid: null,
         detail: `landed on ${host.slice(0, 60)} — ambiguous content`,
