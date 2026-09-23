@@ -263,12 +263,11 @@ export async function getCampaign(id: string): Promise<Campaign | null> {
 
 export async function listCampaigns(): Promise<Campaign[]> {
   const ids = await getIdx("campaigns");
-  const out: Campaign[] = [];
-  for (const id of ids) {
-    const c = await getCampaign(id);
-    if (c) out.push(c);
-  }
-  return out;
+  // Parallel: ~100 campaigns x ~250ms USA->Mumbai RTT would exceed the
+  // Vercel function deadline sequentially (2026-09-23: advance/chain reads
+  // started 504ing after discover grew the store past ~100 campaigns).
+  const all = await Promise.all(ids.map((id) => getCampaign(id).catch(() => null)));
+  return all.filter((c): c is Campaign => !!c);
 }
 
 /** Checkpoint 1 — eligible = active + budget>0 + not already submitted by this device. */

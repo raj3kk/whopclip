@@ -147,15 +147,15 @@ export async function activeChain(
 
 /** All active chains for a device (pump driver iterates these). */
 export async function listActiveChains(device_id: string): Promise<Chain[]> {
-  // Bounded scan: chains are indexed per campaign; walk the campaigns.
+  // Chains are indexed per campaign; walk the campaigns IN PARALLEL.
+  // Sequential reads USA->Mumbai (~250ms each) exceeded the Vercel deadline
+  // once the campaign store grew past ~100 campaigns (2026-09-23).
   const { listCampaigns } = await import("./store");
   const campaigns = await listCampaigns();
-  const out: Chain[] = [];
-  for (const camp of campaigns) {
-    const c = await activeChain(device_id, camp.id);
-    if (c) out.push(c);
-  }
-  return out;
+  const found = await Promise.all(
+    campaigns.map((camp) => activeChain(device_id, camp.id).catch(() => null))
+  );
+  return found.filter((c): c is Chain => !!c);
 }
 
 /** Read-only early check: posts published today (UTC) live in the slot ledger. */
