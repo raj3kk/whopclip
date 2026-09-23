@@ -1,1 +1,1 @@
-{"crons":[{"path":"/api/schedule/tick","schedule":"0 6 * * *"}]}
+{"crons":[{"path":"/api/schedule/tick","schedule":"0 6 * * *"}],"framework":"nextjs"}
