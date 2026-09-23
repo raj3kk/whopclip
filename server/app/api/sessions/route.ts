@@ -48,6 +48,12 @@ export async function GET(req: NextRequest) {
  * POST /api/sessions
  * Body: { device_id, service: "whop"|"instagram", cookies: {...}, user_agent, device_model }
  * Stores the login session AES-256-GCM encrypted.
+ *
+ * MERGE semantics (2026-09-23): incoming cookies are merged into the existing
+ * jar for this device+service instead of replacing it. The phone uploads
+ * whop.com cookies (LoginActivity) and contentrewards.com cookies (Browser tab)
+ * separately — both are needed and must coexist in the one "whop" session the
+ * server-side Content Rewards client reads.
  */
 export async function POST(req: NextRequest) {
   try {
@@ -56,20 +62,32 @@ export async function POST(req: NextRequest) {
     if (!device_id || (service !== "whop" && service !== "instagram") || !cookies) {
       return NextResponse.json({ error: "device_id, service, cookies required" }, { status: 400 });
     }
-    const encrypted = encryptSession(JSON.stringify(cookies));
+    const existing = await getSession(device_id, service as ServiceName);
+    let merged: Record<string, string> = {};
+    if (existing) {
+      try {
+        merged = JSON.parse(decryptSession(existing.encrypted)) as Record<string, string>;
+      } catch {
+        merged = {};
+      }
+    }
+    for (const [k, v] of Object.entries(cookies as Record<string, unknown>)) {
+      if (k && typeof v === "string" && v !== "") merged[k] = v;
+    }
+    const encrypted = encryptSession(JSON.stringify(merged));
     const now = new Date().toISOString();
     await saveSession({
       device_id,
       service: service as ServiceName,
       encrypted,
-      account: typeof account === "string" ? account.slice(0, 80) : "",
-      user_agent: user_agent ?? "",
-      device_model: device_model ?? "",
+      account: typeof account === "string" ? account.slice(0, 80) : (existing?.account ?? ""),
+      user_agent: user_agent ?? (existing?.user_agent ?? ""),
+      device_model: device_model ?? (existing?.device_model ?? ""),
       stale: false,
-      created_at: now,
+      created_at: existing?.created_at ?? now,
       updated_at: now,
     });
-    return NextResponse.json({ ok: true, service });
+    return NextResponse.json({ ok: true, service, merged_cookie_count: Object.keys(merged).length });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "unknown";
     return NextResponse.json({ error: msg }, { status: 500 });

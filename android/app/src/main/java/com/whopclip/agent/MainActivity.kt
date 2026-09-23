@@ -258,6 +258,7 @@ class MainActivity : Activity() {
         val host = try { URL(url).host } catch (_: Exception) { return }
         val service = when {
             host.endsWith("whop.com") -> "whop"
+            host.endsWith("contentrewards.com") -> "whop"
             host.endsWith("instagram.com") -> "instagram"
             else -> return
         }
@@ -337,9 +338,10 @@ class MainActivity : Activity() {
         val host = try { URL(url).host } catch (_: Exception) { "" }
         val service = when {
             host.endsWith("whop.com") -> "whop"
+            host.endsWith("contentrewards.com") -> "whop"
             host.endsWith("instagram.com") -> "instagram"
             else -> {
-                Toast.makeText(this, "Ye site Whop/Instagram nahi hai", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Ye site Whop/Instagram/Content Rewards nahi hai", Toast.LENGTH_SHORT).show()
                 return
             }
         }
