@@ -719,6 +719,28 @@ export async function pumpDeviceChains(device_id: string): Promise<Chain[]> {
  * Called from POST /api/render/result. Only acts when the render id
  * matches the chain's current render stage.
  */
+/**
+ * Record an externally-completed Instagram post (e.g. posted via the
+ * user-authorized browser flow when the server API path is blocked).
+ * Moves the chain from post (active OR failed) to verify.
+ */
+export async function markChainPosted(
+  chain_id: string,
+  ig_post_url: string
+): Promise<Chain | null> {
+  const chain = await getChain(chain_id);
+  if (!chain) return null;
+  if (chain.stage !== "post") return chain;
+  if (!/^https?:\/\//.test(ig_post_url)) return chain;
+  chain.ig_post_url = ig_post_url;
+  chain.stage = "verify";
+  chain.status = "active";
+  chain.attempts = 0;
+  chain.error = null;
+  await saveChain(chain);
+  return chain;
+}
+
 export async function onRenderDone(
   render_id: string,
   ok: boolean,
