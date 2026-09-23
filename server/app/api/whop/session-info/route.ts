@@ -65,8 +65,18 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "unknown probe" }, { status: 400 });
   }
   const device_id = q.get("device_id") ?? "";
+  const jar = JSON.parse(
+    decryptSession((await getSession(device_id, "whop"))!.encrypted)
+  ) as Record<string, string>;
   const cookieHeader = await whopCookieHeader(device_id);
-  const out: Record<string, unknown> = {};
+  const authMode = q.get("auth") ?? "cookies";
+  const bearer =
+    authMode === "bearer-access"
+      ? String(jar["whop-core.access-token"] ?? "")
+      : authMode === "bearer-uid"
+        ? String(jar["whop-core.uid-token"] ?? "")
+        : undefined;
+  const out: Record<string, unknown> = { authMode };
   for (const [name, path] of [
     ["listSubmissions", "/api/submission/submissions?limit=5"],
     ["listDrafts", "/api/submission/submission-drafts?limit=5"],
@@ -75,6 +85,7 @@ export async function POST(req: NextRequest) {
       const res = await crFetch(path, {
         cookieHeader,
         referer: "https://contentrewards.com/discover",
+        bearer,
       });
       const text = await res.text().catch(() => "");
       let code: string | null = null;
