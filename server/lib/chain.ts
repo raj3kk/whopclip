@@ -742,6 +742,24 @@ export async function markChainPosted(
   return chain;
 }
 
+/**
+ * Record a browser-verified reel (live URL opened, caption/tags/aspect
+ * visually confirmed) and advance the chain to submit. Used when the
+ * server-side HTML scrape is blocked by Instagram's datacenter-IP
+ * restrictions but the live post was verified in-browser.
+ */
+export async function markChainVerified(chain_id: string): Promise<Chain | null> {
+  const chain = await getChain(chain_id);
+  if (!chain) return null;
+  if (chain.stage !== "verify" || !chain.ig_post_url) return chain;
+  chain.stage = "submit";
+  chain.status = "active";
+  chain.attempts = 0;
+  chain.error = null;
+  await saveChain(chain);
+  return chain;
+}
+
 export async function onRenderDone(
   render_id: string,
   ok: boolean,
