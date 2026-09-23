@@ -64,6 +64,9 @@ class JobRunnerActivity : Activity() {
         title = "WhopClip job chal raha hai"
 
         webView = findViewById(R.id.jobWebView)
+        // v17: SOFTWARE layer so live-frame capture (draw) shows the page,
+        // not a stale GPU buffer (home screen).
+        webView.setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null)
         statusText = findViewById(R.id.jobStatus)
         progress = findViewById(R.id.jobProgress)
 

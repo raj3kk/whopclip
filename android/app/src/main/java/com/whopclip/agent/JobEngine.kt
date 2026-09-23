@@ -351,6 +351,11 @@ class JobEngine(private val ctx: Context) {
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
     private fun makeWebView(): WebView {
         val wv = WebView(ctx)
+        // v17: SOFTWARE layer — a hardware-accelerated detached WebView's
+        // draw(Canvas) captures a stale GPU buffer (showed the phone's home
+        // screen instead of the page). Software rendering makes live frames
+        // capture the actual page content.
+        wv.setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null)
         wv.settings.javaScriptEnabled = true
         wv.settings.domStorageEnabled = true
         wv.settings.mediaPlaybackRequiresUserGesture = false

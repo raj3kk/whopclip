@@ -10,7 +10,9 @@ import {
   enqueueJob,
   getCampaign,
   getJob,
+  listCampaigns,
   selectCampaign,
+  upsertCampaign,
   type Campaign,
   type Job,
 } from "./store";
@@ -18,13 +20,17 @@ import { extractRequirementsFromText } from "./requirements";
 import { buildRenderSpec, enqueueRender, getRender } from "./render";
 import {
   checkJoinJob,
-  discoverCampaignsJob,
   joinJob,
   igPostJob,
-  verifyReelJob,
   whopSubmitJob,
 } from "./jobs";
 import { startChain, type Chain } from "./chain";
+import {
+  discoverCampaigns,
+  cardToCampaign,
+} from "./whop";
+import { verifyReel } from "./instagram";
+import { logActivity } from "./store";
 
 /** Default Whop Content Rewards discovery page (overridable per run). */
 export const DEFAULT_DISCOVER_URL = "https://whop.com/content-rewards";
@@ -49,7 +55,9 @@ export class RunError extends Error {
 
 /**
  * Enqueue a real JobEngine step template for the phone (or the VM worker):
- *  - discover -> whop_discover (scrapes campaign cards; needs discover_url)
+ *  - discover -> SERVER-SIDE: fetches contentrewards.com/discover on Vercel
+ *                (USA), parses SSR-embedded cards, upserts campaigns. No
+ *                phone job, no discover_url needed.
  *  - check    -> whop_check_join (reads join state + requirements)
  *  - join     -> whop_join (only if not joined)
  *  - render   -> VM worker renders the 9:16 clip (server-side, not the phone).
@@ -61,15 +69,21 @@ export class RunError extends Error {
  *  - full     -> startChain(): check now, server auto-advances the rest
  *                off job completions (chain engine).
  *
- * When no eligible campaign exists and no campaign_id was given, a discover
- * job is enqueued automatically instead of failing — the pipeline refills
- * its own campaign list. Returns campaign=null in that case.
+ * When no eligible campaign exists and no campaign_id was given, a
+ * server-side discover runs automatically instead of failing — the pipeline
+ * refills its own campaign list. Returns campaign=null in that case.
  */
 export async function enqueueRunStep(
   device_id: string,
   step: string,
   opts: RunStepOptions = {}
-): Promise<{ job: Job; campaign: Campaign | null; chain?: Chain }> {
+): Promise<{
+  job: Job;
+  campaign: Campaign | null;
+  chain?: Chain;
+  /** present when the step ran on the server instead of the phone */
+  server_result?: unknown;
+}> {
   if (!device_id) throw new RunError(400, "device_id required");
 
   let campaign: Campaign | null = null;
@@ -98,17 +112,60 @@ export async function enqueueRunStep(
     updated_at: now,
   });
 
-  // No eligible campaign: auto-discover instead of 409. The phone scrapes
-  // the rewards page; /api/campaigns/discover ingests the cards; the next
-  // tick then has campaigns to chain.
+  // ---- Server-side discover helper ----
+  // Discovery now runs on Vercel (USA), not the phone's WebView: the rewards
+  // site SSR-embeds all campaign cards, so a plain server GET is faster,
+  // deterministic, and region-proof. Results go straight into the store.
+  const serverDiscover = async (): Promise<{
+    job: Job;
+    campaign: null;
+    server_result: unknown;
+  }> => {
+    const t0 = Date.now();
+    const cards = await discoverCampaigns();
+    const existing = new Map((await listCampaigns()).map((c) => [c.id, c]));
+    let added = 0;
+    for (const card of cards) {
+      const prev = existing.get(card.id) ?? null;
+      await upsertCampaign(cardToCampaign(card, prev));
+      if (!prev) added++;
+    }
+    const ms = Date.now() - t0;
+    const result = {
+      count: cards.length,
+      added,
+      ms,
+      campaigns: cards.map((c) => ({
+        id: c.id,
+        name: c.title || c.brand,
+        budget_remaining: c.availableBudget,
+        rate: c.ratePer1kLabel,
+      })),
+    };
+    await logActivity(
+      device_id,
+      "server_discover",
+      `Server discover: ${cards.length} campaigns (${added} naye) — ${ms}ms, server-side (USA)`
+    );
+    const job: Job = {
+      id: `server-${crypto.randomUUID()}`,
+      device_id,
+      type: "server_discover",
+      status: "done",
+      steps: [{ action: "server_discover" }],
+      campaign_id: undefined,
+      result,
+      created_at: now,
+      updated_at: new Date().toISOString(),
+    };
+    return { job, campaign: null, server_result: result };
+  };
+
+  // No eligible campaign: auto-discover server-side instead of 409. The
+  // server fetches the rewards page directly; the next tick then has
+  // campaigns to chain.
   if (!campaign && !opts.campaign_id) {
-    const discoverUrl =
-      typeof opts.discover_url === "string" && /^https?:\/\//i.test(opts.discover_url)
-        ? opts.discover_url
-        : DEFAULT_DISCOVER_URL;
-    const job = mkJob("whop_discover", discoverCampaignsJob(discoverUrl));
-    await enqueueJob(job);
-    return { job, campaign: null };
+    return serverDiscover();
   }
   if (!campaign) {
     throw new RunError(
@@ -120,15 +177,9 @@ export async function enqueueRunStep(
   let job: Job;
   switch (step) {
     case "discover": {
-      const discoverUrl =
-        typeof opts.discover_url === "string" ? opts.discover_url : "";
-      if (!discoverUrl || !/^https?:\/\//i.test(discoverUrl)) {
-        throw new RunError(400, "discover_url required for discover step");
-      }
-      job = mkJob("whop_discover", discoverCampaignsJob(discoverUrl), {
-        campaign_id: campaign.id,
-      });
-      break;
+      // Server-side discover (Vercel USA) — no phone job, no discover_url
+      // needed. The rewards site embeds campaign cards in the SSR payload.
+      return serverDiscover();
     }
     case "check":
       job = mkJob("whop_check_join", checkJoinJob(campaign));
@@ -180,12 +231,54 @@ export async function enqueueRunStep(
       if (!ig_post_url || !/^https?:\/\//i.test(ig_post_url)) {
         throw new RunError(400, "ig_post_url required for verify step");
       }
-      job = mkJob(
-        "ig_verify",
-        verifyReelJob(ig_post_url),
-        { payload: { ig_post_url }, campaign_id: campaign.id }
+      // Server-side verify (Vercel): fetch the reel with the user's saved IG
+      // session — live check, caption tags, 9:16, duration. Deterministic,
+      // no phone WebView needed. Fail-closed: not live -> RunError.
+      const required_tags = [
+        ...(campaign.requirements?.required_mentions ?? []),
+        ...(campaign.requirements?.required_hashtags ?? []),
+      ];
+      const vr = await verifyReel(device_id, ig_post_url, { required_tags });
+      await logActivity(
+        device_id,
+        "server_verify",
+        `Server verify: ${ig_post_url} — live=${vr.live} (${vr.checks
+          .map((c) => `${c.name}:${c.ok ? "ok" : "FAIL"}`)
+          .join(", ")})`
       );
-      break;
+      if (!vr.live) {
+        throw new RunError(
+          422,
+          `reel verify failed: ${vr.checks
+            .filter((c) => !c.ok)
+            .map((c) => `${c.name} (${c.detail})`)
+            .join("; ")}`
+        );
+      }
+      const vjob: Job = {
+        id: `server-${crypto.randomUUID()}`,
+        device_id,
+        type: "server_verify",
+        status: "done",
+        steps: [{ action: "server_verify" }],
+        payload: { ig_post_url },
+        campaign_id: campaign.id,
+        result: {
+          verify_result: {
+            live: vr.live,
+            shortcode: vr.shortcode,
+            caption: vr.caption,
+            duration_s: vr.duration_s,
+            width: vr.width,
+            height: vr.height,
+            like_count: vr.like_count,
+            checks: vr.checks,
+          },
+        },
+        created_at: now,
+        updated_at: new Date().toISOString(),
+      };
+      return { job: vjob, campaign, server_result: vjob.result };
     }
     case "post": {
       const caption = typeof opts.caption === "string" ? opts.caption : "";

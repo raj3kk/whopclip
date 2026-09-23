@@ -8,7 +8,40 @@ import { verifyAuthToken, AUTH_COOKIE } from "@/lib/auth";
  * Owner-auth required. New campaigns are upserted with requirements=null and
  * needs_requirements=true so the check step extracts + parses the brief
  * before anything renders.
+ *
+ * FAIL-CLOSED ingestion (2026-09-23): a discover job once saved a junk card
+ * {name:"$0.0069", url:"https://whop.com/home/"} after the rewards page
+ * redirected to /home/. Only URLs that look like real campaign detail pages
+ * (UUID in path) are accepted; everything else is rejected and counted.
  */
+function isValidCampaignUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    if (
+      host !== "contentrewards.com" &&
+      !host.endsWith(".contentrewards.com") &&
+      host !== "whop.com" &&
+      !host.endsWith(".whop.com")
+    ) {
+      return false;
+    }
+    if (/^\/(home\/?)?$/.test(u.pathname)) return false;
+    // A real campaign page carries its UUID in the path.
+    return /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+/** Reject junk names like "$0.0069" (dollar-text fallback artifacts). */
+function isValidCampaignName(name: string): boolean {
+  const n = name.trim();
+  if (n.length < 3) return false;
+  if (/^\$[\d.,\s]+$/.test(n)) return false;
+  return true;
+}
+
 export async function POST(req: NextRequest) {
   if (!verifyAuthToken(req.cookies.get(AUTH_COOKIE)?.value)) {
     return NextResponse.json({ error: "login required" }, { status: 401 });
@@ -29,11 +62,15 @@ export async function POST(req: NextRequest) {
     const now = new Date().toISOString();
     let added = 0;
     let updated = 0;
+    let rejected = 0;
     for (const card of cards.slice(0, 40)) {
       const url = typeof card.url === "string" ? card.url.trim() : "";
-      if (!url || !/^https?:\/\//i.test(url)) continue;
       const name =
         (typeof card.name === "string" && card.name.trim()) || "Untitled campaign";
+      if (!isValidCampaignUrl(url) || !isValidCampaignName(name)) {
+        rejected++;
+        continue;
+      }
       // payout hint from card text: "$4 per 1k"
       let payout = 0;
       const pm = (card.text ?? "").match(/\$\s*(\d+(?:\.\d+)?)\s*(?:per|\/)\s*1\s*k/i);
@@ -55,7 +92,7 @@ export async function POST(req: NextRequest) {
       if (prev) updated++;
       else added++;
     }
-    return NextResponse.json({ ok: true, added, updated });
+    return NextResponse.json({ ok: true, added, updated, rejected });
   } catch (e: unknown) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "unknown" },

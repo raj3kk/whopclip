@@ -82,7 +82,6 @@ export default function Dashboard() {
   const [caption, setCaption] = useState<Record<string, string>>({});
   const [videoUrl, setVideoUrl] = useState<Record<string, string>>({});
   const [live, setLive] = useState<LiveData | null>(null);
-  const [discoverUrl, setDiscoverUrl] = useState("https://whop.com/content-rewards");
 
   const load = useCallback(async () => {
     const d = await jget("/api/devices");
@@ -144,6 +143,17 @@ export default function Dashboard() {
     const r = await jpost("/api/run", body);
     setBusy(null);
     if (!r.ok) alert("Run failed: " + (r.j.error || r.status));
+    else if ((r.j as { server_side?: boolean }).server_side) {
+      const sr = (r.j as { server_result?: { verify_result?: { live?: boolean; checks?: Array<{ name: string; ok: boolean; detail: string }> } } }).server_result;
+      const vr = sr?.verify_result;
+      if (vr) {
+        const lines = (vr.checks ?? []).map((c) => `${c.ok ? "✅" : "❌"} ${c.name}: ${c.detail}`).join("\n");
+        alert(`Server verify: reel ${vr.live ? "LIVE hai" : "LIVE NAHI hai"}\n\n${lines}`);
+      } else {
+        alert("Server pe ho gaya: " + JSON.stringify(sr ?? {}).slice(0, 300));
+      }
+      load();
+    }
     else { setTab("jobs"); load(); }
   }
 
@@ -154,13 +164,28 @@ export default function Dashboard() {
   }
 
   async function discoverNow() {
-    const url = discoverUrl.trim();
-    if (!url) { alert("Discover URL daalo"); return; }
     setBusy("discover");
-    const r = await jpost("/api/run", { device_id: deviceId, step: "discover", discover_url: url });
+    const r = await jpost("/api/whop/discover", { device_id: deviceId });
     setBusy(null);
     if (!r.ok) alert("Discover failed: " + (r.j.error || r.status));
-    else { setTab("jobs"); load(); }
+    else {
+      const sr = r.j as { count?: number; added?: number };
+      alert(`Server discover: ${sr.count ?? 0} campaigns (${sr.added ?? 0} naye) — store me save ho gaye`);
+      load();
+    }
+  }
+
+  async function serverCheck(c: Campaign) {
+    setBusy("check-" + c.id);
+    const r = await fetch(`/api/whop/campaigns/${c.id}?device_id=${encodeURIComponent(deviceId)}`);
+    const j = await r.json().catch(() => ({}));
+    setBusy(null);
+    if (!r.ok) alert("Server check failed: " + (j.error || r.status));
+    else {
+      const cc = (j as { campaign?: { name?: string; joined?: boolean; budget_remaining?: number } }).campaign ?? {};
+      alert(`${cc.name ?? c.name}: joined=${cc.joined ? "haan" : "nahi"}, budget $${cc.budget_remaining ?? "?"}`);
+      load();
+    }
   }
 
   async function retryJob(id: string) {
@@ -295,23 +320,15 @@ export default function Dashboard() {
       {tab === "campaigns" && (
         <>
           <div className="card">
-            <h3 style={{ marginTop: 0 }}>🔍 Campaigns discover karo</h3>
+            <h3 style={{ marginTop: 0 }}>🔍 Server Discover (USA server se)</h3>
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "end" }}>
-              <div style={{ flex: 1, minWidth: 220 }}>
-                <label>Discover URL</label>
-                <input
-                  value={discoverUrl}
-                  onChange={(e) => setDiscoverUrl(e.target.value)}
-                  placeholder="https://whop.com/content-rewards"
-                />
-              </div>
-              <button className="btn small green" disabled={busy === "discover" || !dev?.online} onClick={discoverNow}>
-                {busy === "discover" ? "…" : "🔍 Discover"}
+              <button className="btn small green" disabled={busy === "discover"} onClick={discoverNow}>
+                {busy === "discover" ? "…" : "⚡ Server Discover"}
               </button>
             </div>
             <p className="muted" style={{ fontSize: 13 }}>
-              List khaali ho to bhi yahan se discover chala sakte ho — phone Whop se campaign cards
-              nikaal ke yahan save karega.
+              Phone ke WebView ki zaroorat nahi — Vercel (USA) server khud Whop se campaign
+              cards nikaal ke yahan save karega. Phone offline ho tab bhi chalega.
             </p>
           </div>
           <div className="card">
@@ -332,7 +349,7 @@ export default function Dashboard() {
           </div>
 
           {campaignsErr && <div className="alert warn">Campaigns: {campaignsErr} — phone me Whop login karo.</div>}
-          {campaigns?.length === 0 && <div className="card muted">Koi campaign nahi mili. Phone se check job chalao — wo Whop se campaigns discover karega.</div>}
+          {campaigns?.length === 0 && <div className="card muted">Koi campaign nahi mili. Upar "⚡ Server Discover" dabao — server khud Whop se campaigns laayega.</div>}
           {(campaigns ?? []).map((c) => (
             <div className="card" key={c.id}>
               <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -358,6 +375,9 @@ export default function Dashboard() {
                 </select>
                 <button className="btn small green" disabled={busy === c.id || !dev?.online} onClick={() => runNow(c)}>
                   {busy === c.id ? "…" : "▶ Run Now"}
+                </button>
+                <button className="btn small ghost" disabled={busy === "check-" + c.id} onClick={() => serverCheck(c)}>
+                  {busy === "check-" + c.id ? "…" : "⚡ Server check"}
                 </button>
                 <a className="btn small ghost" href={c.whop_url} target="_blank" rel="noreferrer">Whop ↗</a>
               </div>
