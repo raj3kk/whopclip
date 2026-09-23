@@ -23,7 +23,8 @@ FAIL-CLOSED: no authorized source / no speech / invalid output / no cover
 -> ok=false with the reason (the chain then fails with that reason instead
 of hanging). cover_url is REQUIRED for ok=true — no placeholder, ever.
 
-Secrets: only WHOPCLIP_CRON_SECRET (env). Never touches Whop/IG sessions.
+Secrets: only the server's CRON_SECRET value (passed in the local env var
+WHOPCLIP_CRON_SECRET). Never touches Whop/IG sessions.
 
 Usage:
   WHOPCLIP_CRON_SECRET=... python3 worker/render_worker.py --once
