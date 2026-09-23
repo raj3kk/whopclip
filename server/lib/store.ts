@@ -176,15 +176,6 @@ export async function markSessionStale(device_id: string, service: ServiceName):
   await kv.set(sessionKey(device_id, service), s);
 }
 
-/** Clears the stale flag (session verified healthy again). */
-export async function clearSessionStale(device_id: string, service: ServiceName): Promise<void> {
-  const s = await getSession(device_id, service);
-  if (!s || !s.stale) return;
-  s.stale = false;
-  s.updated_at = new Date().toISOString();
-  await kv.set(sessionKey(device_id, service), s);
-}
-
 export async function sessionStatus(device_id: string): Promise<
   Record<ServiceName, { linked: boolean; stale: boolean; account: string; updated_at: string }>
 > {
@@ -560,10 +551,14 @@ export async function touchDevice(
   }
 }
 
-/** Online = polled within the last 5 minutes. */
+/** Online = polled within the last 30 minutes.
+ * This window must stay comfortably ABOVE the phone's 15-min PollWorker
+ * interval: with the old 5-min window the server reported "offline" ~10 min
+ * out of every 15 even when the phone was perfectly healthy (2026-09-23),
+ * which is what the app's Profile "Server status" line shows. */
 export function deviceOnline(d: Device): boolean {
   if (!d.last_poll_at) return false;
-  return Date.now() - new Date(d.last_poll_at).getTime() < 5 * 60 * 1000;
+  return Date.now() - new Date(d.last_poll_at).getTime() < 30 * 60 * 1000;
 }
 
 /** Explicit online/offline presence from the phone's Profile tab. */
