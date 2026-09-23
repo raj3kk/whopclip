@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { verifyAuthToken, AUTH_COOKIE } from "@/lib/auth";
 import { decryptSession } from "@/lib/crypto";
 import { getSession } from "@/lib/store";
+import { crFetch, whopCookieHeader } from "@/lib/whop";
 
 /**
  * TEMPORARY diagnostic: GET /api/whop/session-info?device_id=...
@@ -43,4 +44,56 @@ export async function GET(req: NextRequest) {
     updated_at: s.updated_at,
     note: "values never returned",
   });
+}
+
+/**
+ * TEMPORARY read-only probe: POST /api/whop/session-info?device_id=...&probe=submission-scope
+ * (owner auth). Performs ONLY GET requests:
+ *   - GET /api/submission/submissions?limit=5  (list my submissions)
+ * Returns {status, ok} per call — never bodies, never secrets.
+ */
+export async function POST(req: NextRequest) {
+  if (!verifyAuthToken(req.cookies.get(AUTH_COOKIE)?.value)) {
+    return NextResponse.json({ error: "login required" }, { status: 401 });
+  }
+  const q = new URL(req.url).searchParams;
+  if (q.get("probe") !== "submission-scope") {
+    return NextResponse.json({ error: "unknown probe" }, { status: 400 });
+  }
+  const device_id = q.get("device_id") ?? "";
+  const cookieHeader = await whopCookieHeader(device_id);
+  const out: Record<string, unknown> = {};
+  for (const [name, path] of [
+    ["listSubmissions", "/api/submission/submissions?limit=5"],
+    ["listDrafts", "/api/submission/submission-drafts?limit=5"],
+  ] as const) {
+    try {
+      const res = await crFetch(path, {
+        cookieHeader,
+        referer: "https://contentrewards.com/discover",
+      });
+      const text = await res.text().catch(() => "");
+      let code: string | null = null;
+      try {
+        const j = JSON.parse(text) as { code?: string; error?: string };
+        code = j.code ?? j.error ?? null;
+      } catch { /* non-JSON */ }
+      // Count items without returning content
+      let count: number | null = null;
+      try {
+        const j = JSON.parse(text) as unknown;
+        if (Array.isArray(j)) count = j.length;
+        else if (j && typeof j === "object") {
+          const o = j as Record<string, unknown>;
+          if (Array.isArray(o.items)) count = o.items.length;
+          else if (Array.isArray(o.data)) count = o.data.length;
+          else if (Array.isArray(o.submissions)) count = o.submissions.length;
+        }
+      } catch { /* ignore */ }
+      out[name] = { status: res.status, ok: res.ok, code, count };
+    } catch (e) {
+      out[name] = { status: -1, ok: false, code: e instanceof Error ? e.message : "net" };
+    }
+  }
+  return NextResponse.json(out);
 }
