@@ -2,7 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { verifyAuthToken, AUTH_COOKIE } from "@/lib/auth";
 import { decryptSession, encryptSession } from "@/lib/crypto";
 import { getSession, saveSession } from "@/lib/store";
-import { crFetch, whopCookieHeader } from "@/lib/whop";
+import {
+  crFetch,
+  whopCookieHeader,
+  getCampaignDetail,
+  probeJoinState,
+} from "@/lib/whop";
 
 /** Content Rewards Next.js server action ids (from live /login chunks, 2026-09-23). */
 const CR_ACTIONS = {
@@ -227,9 +232,94 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  if (probeName !== "submission-scope") {
+  if (probeName !== "submission-scope" && probeName !== "submission-dupe-check" && probeName !== "campaign-recheck") {
     return NextResponse.json({ error: "unknown probe" }, { status: 400 });
   }
+
+  // --- TEMP read-only: submission/draft duplicate metadata (no bodies, no URLs, no secrets) ---
+  if (probeName === "submission-dupe-check") {
+    const device_id = q.get("device_id") ?? "";
+    const cookieHeader = await whopCookieHeader(device_id);
+    const pick = (o: Record<string, unknown>) => {
+      const out: Record<string, unknown> = {};
+      for (const k of ["id", "campaignId", "campaign_id", "campaignID", "status", "platform", "createdAt", "created_at", "state", "reviewStatus"]) {
+        if (o[k] !== undefined && typeof o[k] !== "object") out[k] = o[k];
+      }
+      return out;
+    };
+    const out: Record<string, unknown> = { probe: probeName };
+    for (const [name, path] of [
+      ["submissions", "/api/submission/submissions?limit=50"],
+      ["drafts", "/api/submission/submission-drafts?limit=50"],
+    ] as const) {
+      try {
+        const res = await crFetch(path, {
+          cookieHeader,
+          referer: "https://contentrewards.com/discover",
+        });
+        const text = await res.text().catch(() => "");
+        let items: unknown[] = [];
+        try {
+          const j = JSON.parse(text) as unknown;
+          if (Array.isArray(j)) items = j;
+          else if (j && typeof j === "object") {
+            const o = j as Record<string, unknown>;
+            for (const k of ["items", "data", "submissions", "drafts"]) {
+              if (Array.isArray(o[k])) { items = o[k] as unknown[]; break; }
+            }
+          }
+        } catch { /* non-JSON */ }
+        out[name] = {
+          status: res.status,
+          ok: res.ok,
+          count: items.length,
+          items: items
+            .filter((i) => i && typeof i === "object")
+            .map((i) => pick(i as Record<string, unknown>)),
+        };
+      } catch (e) {
+        out[name] = { status: -1, ok: false, error: e instanceof Error ? e.message : "net" };
+      }
+    }
+    return NextResponse.json(out);
+  }
+
+  // --- TEMP read-only: campaign eligibility recheck (detail + join state) ---
+  if (probeName === "campaign-recheck") {
+    const device_id = q.get("device_id") ?? "";
+    const campaign_id = q.get("campaign_id") ?? "";
+    if (!/^[0-9a-f-]{36}$/i.test(campaign_id)) {
+      return NextResponse.json({ error: "campaign_id required" }, { status: 400 });
+    }
+    try {
+      const detail = await getCampaignDetail(campaign_id);
+      let joined: boolean | null = null;
+      let joinDetail = "not probed";
+      if (device_id) {
+        const probe = await probeJoinState(device_id, campaign_id);
+        joined = probe.joined;
+        joinDetail = probe.detail;
+      }
+      return NextResponse.json({
+        probe: probeName,
+        id: detail.id,
+        name: detail.name,
+        brand: detail.brand,
+        status: detail.status,
+        budget_remaining: detail.budgetRemaining,
+        payouts: detail.payouts,
+        primary_payout_cents: detail.primaryPayoutCents,
+        platforms: detail.platforms,
+        requires_application: detail.requiresApplication,
+        content_requirements: detail.contentRequirements,
+        joined,
+        join_detail: joinDetail,
+      });
+    } catch (e) {
+      return NextResponse.json({ error: e instanceof Error ? e.message : "probe failed" }, { status: 502 });
+    }
+  }
+
   const device_id = q.get("device_id") ?? "";
   const jar = JSON.parse(
     decryptSession((await getSession(device_id, "whop"))!.encrypted)
