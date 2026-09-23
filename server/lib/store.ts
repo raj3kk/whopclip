@@ -176,6 +176,15 @@ export async function markSessionStale(device_id: string, service: ServiceName):
   await kv.set(sessionKey(device_id, service), s);
 }
 
+/** Clears the stale flag (session verified healthy again). */
+export async function clearSessionStale(device_id: string, service: ServiceName): Promise<void> {
+  const s = await getSession(device_id, service);
+  if (!s || !s.stale) return;
+  s.stale = false;
+  s.updated_at = new Date().toISOString();
+  await kv.set(sessionKey(device_id, service), s);
+}
+
 export async function sessionStatus(device_id: string): Promise<
   Record<ServiceName, { linked: boolean; stale: boolean; account: string; updated_at: string }>
 > {
