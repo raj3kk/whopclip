@@ -435,6 +435,17 @@ export async function requeueStuckJobs(
     if (job.status !== "running") continue;
     const last = job.last_heartbeat ?? job.updated_at;
     if (now - new Date(last).getTime() < staleAfterMs) continue;
+    if (job.cancel_requested) {
+      // Owner ne cancel manga tha — ise dobara zinda mat karo. Phone ne
+      // heartbeat nahi bheja (offline/mara hua), to server-side hi cancelled
+      // finalize karo taaki ye kabhi claim na ho.
+      job.status = "cancelled";
+      job.cancel_requested = false;
+      job.updated_at = new Date().toISOString();
+      await kv.set(`job:${job.id}`, job);
+      await logActivity(job.device_id, "job_cancelled", `Cancel finalize (stuck + cancel_requested): ${job.type}`, job);
+      continue;
+    }
     const r = await requeueJob(job.id, `Stuck tha (heartbeat ${(Math.round((now - new Date(last).getTime()) / 60000))}m purana) — dobara queue: ${job.type}`);
     if (r) requeued.push(r);
   }
