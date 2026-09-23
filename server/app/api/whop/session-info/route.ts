@@ -53,7 +53,11 @@ export async function GET(req: NextRequest) {
  * Returns {status, ok} per call — never bodies, never secrets.
  */
 export async function POST(req: NextRequest) {
-  if (!verifyAuthToken(req.cookies.get(AUTH_COOKIE)?.value)) {
+  const authed =
+    verifyAuthToken(req.cookies.get(AUTH_COOKIE)?.value) ||
+    (!!process.env.SESSION_CHECK_SECRET &&
+      req.headers.get("x-cron-secret") === process.env.SESSION_CHECK_SECRET);
+  if (!authed) {
     return NextResponse.json({ error: "login required" }, { status: 401 });
   }
   const q = new URL(req.url).searchParams;
