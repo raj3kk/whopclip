@@ -730,7 +730,8 @@ export async function markChainPosted(
 ): Promise<Chain | null> {
   const chain = await getChain(chain_id);
   if (!chain) return null;
-  if (chain.stage !== "post") return chain;
+  // Accept post stage (normal) or verify stage (URL correction after a bad mark).
+  if (chain.stage !== "post" && chain.stage !== "verify") return chain;
   if (!/^https?:\/\//.test(ig_post_url)) return chain;
   chain.ig_post_url = ig_post_url;
   chain.stage = "verify";
