@@ -94,6 +94,18 @@ export async function POST(req: NextRequest) {
         ? String(jar["whop-core.uid-token"] ?? "")
         : undefined;
   const out: Record<string, unknown> = { authMode };
+  // Non-secret JWT claim metadata for the access token (helps diagnose aud/iss mismatch)
+  try {
+    const at = String(jar["whop-core.access-token"] ?? "");
+    if (at.split(".").length === 3) {
+      const p = JSON.parse(Buffer.from(at.split(".")[1], "base64").toString()) as Record<string, unknown>;
+      const safe: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(p)) {
+        safe[k] = typeof v === "string" && v.length > 60 ? `<str len ${v.length}>` : v;
+      }
+      out["accessTokenClaims"] = safe;
+    }
+  } catch { /* ignore */ }
   for (const [name, path, method, json] of [
     ["listSubmissions", "/api/submission/submissions?limit=5", "GET", undefined],
     ["listDrafts", "/api/submission/submission-drafts?limit=5", "GET", undefined],
