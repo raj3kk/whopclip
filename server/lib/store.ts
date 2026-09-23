@@ -53,6 +53,8 @@ export interface Campaign {
   budget_remaining: number;
   payout_per_1k: number;
   joined: boolean;
+  /** campaign needs an application/review before joining (fail-closed: auto-flow skips) */
+  requiresApplication?: boolean;
   requirements: Requirements | null;
   created_at: string;
   updated_at: string;

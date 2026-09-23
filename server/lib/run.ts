@@ -30,6 +30,7 @@ import {
 } from "./whop";
 import { verifyReel } from "./instagram";
 import { logActivity } from "./store";
+import { runAutoDiscover } from "./automation";
 
 /** Default Whop Content Rewards discovery page (overridable per run). */
 export const DEFAULT_DISCOVER_URL = "https://whop.com/content-rewards";
@@ -168,6 +169,44 @@ export async function enqueueRunStep(
     };
     return { job, campaign: null, server_result: result };
   };
+
+  // No stored eligible campaign (or step=full without a specific campaign):
+  // auto-discover via the search API, score every campaign with a logged
+  // rationale, and start ONE chain on the top eligible pick (fail-closed
+  // gates still apply inside startChain/advanceChain). This is the
+  // server-side equivalent of the user's in-app flow: search -> scroll ->
+  // pick the best.
+  if (!campaign && !opts.campaign_id && step === "full") {
+    const auto = await runAutoDiscover(device_id, { dryRun: false });
+    if (auto.picked && auto.started_chain_id) {
+      const autoCamp = await getCampaign(auto.picked.hit.id);
+      const job = serverMarker(
+        "server_chain",
+        device_id,
+        auto.picked.hit.id,
+        {
+          chain_id: auto.started_chain_id,
+          auto_discover: true,
+          score: auto.picked.score,
+          rationale: auto.picked.rationale,
+        },
+        now
+      );
+      return {
+        job,
+        campaign: autoCamp,
+        server_result: {
+          chain_id: auto.started_chain_id,
+          campaign_name: auto.picked.hit.name,
+          score: auto.picked.score,
+        },
+      };
+    }
+    throw new RunError(
+      409,
+      `auto-discover: no eligible campaign (${auto.ranked.length} scored, ${auto.ranked.filter((r) => r.excluded).length} excluded)`
+    );
+  }
 
   // No eligible campaign: auto-discover server-side instead of 409. The
   // server fetches the rewards page directly; the next tick then has

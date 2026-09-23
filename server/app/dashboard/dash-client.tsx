@@ -90,6 +90,13 @@ export default function Dashboard() {
   const [videoUrl, setVideoUrl] = useState<Record<string, string>>({});
   const [coverUrl, setCoverUrl] = useState<Record<string, string>>({});
   const [live, setLive] = useState<LiveData | null>(null);
+  const [autoQuery, setAutoQuery] = useState("instagram");
+  const [autoResult, setAutoResult] = useState<{
+    query: string; hits_seen: number; started_chain_id: string | null; dry_run: boolean;
+    ranked: Array<{ id: string; name: string; score: number; excluded: boolean; excludeReason: string | null; rationale: string[]; rate_per_1k: number; budget_remaining: number; requiresApplication: boolean; joined: boolean; video_assets: number }>;
+    picked: { id: string; name: string; score: number; rationale: string[] } | null;
+    brief: { campaign_name: string; rate_per_1k: number; budget_remaining: number; caption_rules: string; title_templates: string[]; video_specs: string[]; dos_donts: string[]; assets: Array<{ name: string; url: string }>; creator_requirements: string } | null;
+  } | null>(null);
 
   const load = useCallback(async () => {
     const d = await jget("/api/devices");
@@ -208,6 +215,20 @@ export default function Dashboard() {
       const list = (r.j.chains ?? []) as ChainInfo[];
       const summ = list.map((c) => `${c.campaign_name}: ${c.stage} (${c.status})`).join("\n") || "koi active chain nahi";
       alert(`⛓️ Chains pumped:\n${summ}`);
+      load();
+    }
+  }
+
+  async function autoDiscover(dryRun: boolean) {
+    if (!dryRun && !confirm("Top-scored campaign pe REAL chain start hogi (check → join → render → post → verify → submit). Pakka?")) return;
+    setBusy(dryRun ? "auto-dry" : "auto-run");
+    const r = await jpost("/api/automation/discover", { device_id: deviceId, query: autoQuery, dry_run: dryRun });
+    setBusy(null);
+    if (!r.ok) { alert("Auto-discover failed: " + (r.j.error || r.status)); return; }
+    setAutoResult(r.j as NonNullable<typeof autoResult>);
+    if (!dryRun) {
+      const sid = (r.j as { started_chain_id?: string | null }).started_chain_id;
+      alert(sid ? `🤖 Chain start ho gayi: ${sid} — Chains tab me dekho` : "Koi eligible campaign nahi mili — ranked table dekho");
       load();
     }
   }
@@ -355,6 +376,71 @@ export default function Dashboard() {
               cards nikaal ke yahan save karega. Phone offline ho tab bhi chalega.
             </p>
           </div>
+          <div className="card">
+            <h3 style={{ marginTop: 0 }}>🤖 Auto pipeline — search → score → select</h3>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "end" }}>
+              <div>
+                <label>Search keyword</label>
+                <input value={autoQuery} onChange={(e) => setAutoQuery(e.target.value)} style={{ width: 180 }} placeholder="instagram" />
+              </div>
+              <button className="btn small green" disabled={busy === "auto-dry"} onClick={() => autoDiscover(true)}>
+                {busy === "auto-dry" ? "…" : "🔎 Discover + score (dry run)"}
+              </button>
+              <button className="btn small" disabled={busy === "auto-run"} onClick={() => autoDiscover(false)} style={{ background: "#b3541e", color: "#fff" }}>
+                {busy === "auto-run" ? "…" : "▶ Auto-run top pick"}
+              </button>
+            </div>
+            <p className="muted" style={{ fontSize: 13 }}>
+              App ke search box jaisa: keyword search → pages scroll → har campaign ka score + reason →
+              top pick. Dry run me kuch start nahi hota. Auto-run ek chain start karta hai
+              (sare fail-closed gates ke saath).
+            </p>
+          </div>
+          {autoResult && (
+            <div className="card">
+              <h3 style={{ marginTop: 0 }}>
+                📊 Auto-discover result <span className="muted" style={{ fontSize: 13 }}>“{autoResult.query}” · {autoResult.hits_seen} campaigns dekhe{autoResult.dry_run ? " · dry run" : ""}</span>
+              </h3>
+              {autoResult.picked && (
+                <div className="alert" style={{ borderLeft: "4px solid #2e7d32", padding: 10, marginBottom: 12 }}>
+                  <b>🏆 Pick: {autoResult.picked.name}</b> <span className="badge green">score {autoResult.picked.score.toFixed(3)}</span>
+                  {autoResult.started_chain_id && <div className="muted" style={{ fontSize: 12 }}>chain: <code>{autoResult.started_chain_id}</code></div>}
+                </div>
+              )}
+              {!autoResult.picked && <div className="alert warn">Koi eligible campaign nahi — sab excluded (neeche reason dekho).</div>}
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse" }}>
+                  <thead><tr style={{ textAlign: "left", borderBottom: "1px solid #ddd" }}>
+                    <th>Campaign</th><th>Score</th><th>$/1k</th><th>Budget</th><th>Assets</th><th>Status</th>
+                  </tr></thead>
+                  <tbody>
+                    {autoResult.ranked.map((r) => (
+                      <tr key={r.id} style={{ borderBottom: "1px solid #eee", opacity: r.excluded ? 0.65 : 1 }}>
+                        <td><b>{r.name}</b>{r.joined && <span className="badge green" style={{ marginLeft: 6 }}>joined</span>}{r.requiresApplication && <span className="badge yellow" style={{ marginLeft: 6 }}>application</span>}</td>
+                        <td>{r.excluded ? "—" : r.score.toFixed(3)}</td>
+                        <td>${r.rate_per_1k.toFixed(2)}</td>
+                        <td>${r.budget_remaining.toFixed(0)}</td>
+                        <td>{r.video_assets}🎬</td>
+                        <td style={{ fontSize: 12 }}>{r.excluded ? `❌ ${r.excludeReason}` : "✅ eligible"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {autoResult.picked && (
+                <details style={{ marginTop: 10 }}>
+                  <summary className="muted" style={{ cursor: "pointer", fontSize: 13 }}>Score rationale — {autoResult.picked.name}</summary>
+                  <pre className="logs">{autoResult.picked.rationale.join("\n")}</pre>
+                </details>
+              )}
+              {autoResult.brief && (
+                <details style={{ marginTop: 10 }}>
+                  <summary className="muted" style={{ cursor: "pointer", fontSize: 13 }}>📋 Extracted requirements — Content / Creator / Reference</summary>
+                  <pre className="logs">{JSON.stringify(autoResult.brief, null, 2)}</pre>
+                </details>
+              )}
+            </div>
+          )}
           <div className="card">
             <h3 style={{ marginTop: 0 }}>⏰ Daily schedule</h3>
             <div style={{ display: "flex", gap: 10, alignItems: "end", flexWrap: "wrap" }}>

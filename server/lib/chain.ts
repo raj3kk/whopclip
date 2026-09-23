@@ -52,8 +52,10 @@ import {
   probeJoinState,
   applyToCampaign,
   createSubmission,
+  getApiDetail,
   type ApiResult,
 } from "./whop";
+import { buildStructuredBrief } from "./automation";
 import { verifyReel } from "./instagram";
 
 export type ChainStage =
@@ -265,6 +267,16 @@ async function runCheckStage(chain: Chain): Promise<"advanced" | "failed"> {
     );
     return "failed";
   }
+  // Structured brief from the campaign API (guidelines, creator
+  // requirements, flags, reference assets) — richer than the page parse.
+  // Falls back to the page detail when the API hiccups.
+  let brief: ReturnType<typeof buildStructuredBrief> | null = null;
+  try {
+    const hit = await getApiDetail(chain.campaign_id);
+    brief = buildStructuredBrief(hit);
+  } catch {
+    brief = null;
+  }
   const briefText = [
     detail.name,
     detail.description,
@@ -272,11 +284,22 @@ async function runCheckStage(chain: Chain): Promise<"advanced" | "failed"> {
   ]
     .filter(Boolean)
     .join("\n");
-  if (briefText.trim().length < 50) {
+  if (briefText.trim().length < 50 && !brief) {
     await bumpAttempt(chain, "check produced no usable requirements text");
     return "failed";
   }
-  const extraction = extractRequirementsFromText(briefText);
+  const briefParsed = brief ? (JSON.parse(brief.requirements_json) as {
+    requirements: Campaign["requirements"];
+    extraction_complete: boolean;
+    extraction_missing: string[];
+  }) : null;
+  const extraction = briefParsed
+    ? {
+        requirements: briefParsed.requirements,
+        complete: briefParsed.extraction_complete,
+        missing: briefParsed.extraction_missing,
+      }
+    : extractRequirementsFromText(briefText);
   if (!extraction.complete) {
     await failChain(
       chain,
@@ -286,16 +309,21 @@ async function runCheckStage(chain: Chain): Promise<"advanced" | "failed"> {
   }
   const joinProbe = await probeJoinState(chain.device_id, chain.campaign_id);
   const alreadyJoined = joinProbe.joined === true || campaign.joined === true;
-  chain.requirements_json = JSON.stringify({
-    requirements: extraction.requirements,
-    authorized_sources: extraction.authorized_sources,
-    title_templates: extraction.title_templates,
-  });
+  chain.requirements_json = brief
+    ? brief.requirements_json
+    : JSON.stringify({
+        requirements: extraction.requirements,
+        authorized_sources:
+          "authorized_sources" in extraction ? extraction.authorized_sources : [],
+        title_templates:
+          "title_templates" in extraction ? extraction.title_templates : [],
+      });
   await upsertCampaign({
     ...campaign,
     name: detail.name || campaign.name,
     requirements: extraction.requirements,
     joined: alreadyJoined,
+    requiresApplication: detail.requiresApplication,
     updated_at: new Date().toISOString(),
   });
   if (joinProbe.joined === null && !campaign.joined) {
@@ -315,6 +343,15 @@ async function runJoinStage(chain: Chain): Promise<"advanced" | "failed"> {
   const campaign = await getCampaign(chain.campaign_id);
   if (!campaign) {
     await failChain(chain, "campaign vanished mid-chain");
+    return "failed";
+  }
+  // Fail-closed: campaigns that need an application/review can't be joined
+  // by automation (no answers to give, approval is human). Manual only.
+  if (campaign.requiresApplication) {
+    await failChain(
+      chain,
+      "campaign requires an application/review — auto-join refused (manual apply only)"
+    );
     return "failed";
   }
   let res: ApiResult;
@@ -400,6 +437,50 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
   if (!chain.caption) {
     await failChain(chain, "post stage reached without a caption");
     return "failed";
+  }
+  // Gap G1 — budget exhaustion mid-chain: re-check the live budget right
+  // before we spend a daily post slot. A campaign that hit $0 while the
+  // chain was rendering must fail, not post.
+  try {
+    const live = await getApiDetail(chain.campaign_id);
+    if (live.budgetRemaining <= 0) {
+      await failChain(
+        chain,
+        `budget exhausted mid-chain ($${live.budgetRemaining.toFixed(2)} remaining) — post refused`
+      );
+      return "failed";
+    }
+    if (live.status !== "active") {
+      await failChain(chain, `campaign went ${live.status} mid-chain — post refused`);
+      return "failed";
+    }
+  } catch (e: unknown) {
+    await bumpAttempt(
+      chain,
+      `pre-post budget check failed: ${e instanceof Error ? e.message : "unknown"}`
+    );
+    return "failed";
+  }
+  // Gap G2 — caption builder verification: every required @mention/#hashtag
+  // from the brief must be literally present in the caption before upload.
+  {
+    const parsed = JSON.parse(chain.requirements_json ?? "{}");
+    const req = parsed.requirements ?? {};
+    const requiredTags = [
+      ...((req.required_mentions as string[]) ?? []),
+      ...((req.required_hashtags as string[]) ?? []),
+    ];
+    const captionLower = ` ${chain.caption.toLowerCase()} `;
+    const trulyMissing = requiredTags.filter(
+      (t) => t && !captionLower.includes(t.toLowerCase())
+    );
+    if (trulyMissing.length > 0) {
+      await failChain(
+        chain,
+        `caption missing required tags: ${trulyMissing.join(", ")} — upload refused`
+      );
+      return "failed";
+    }
   }
   // Early read-only slot check: refuse/park when today's cap is already
   // reached. The authoritative atomic reservation happens inside the upload,

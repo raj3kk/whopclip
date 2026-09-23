@@ -26,8 +26,21 @@
 import { decryptSession } from "./crypto";
 import { getSession, type Campaign } from "./store";
 import { extractRequirementsFromText } from "./requirements";
+import { getCampaignFromApi, hitToCampaign } from "./search";
 
-const CR_BASE = "https://contentrewards.com";
+export const CR_BASE = "https://contentrewards.com";
+/** Public S3 bucket where campaign reference assets are hosted (seen on
+ *  campaign pages; the API returns paths relative to this base). */
+export const CR_ASSET_BASE =
+  "https://content-rewards-production-publicassetsbucket-oxvzxvnr.s3.us-east-1.amazonaws.com/";
+
+/** Resolve a referenceMaterial url (absolute, youtu.be, or bucket-relative). */
+export function absoluteAssetUrl(u: string): string {
+  const t = (u || "").trim();
+  if (!t) return "";
+  if (/^https?:\/\//i.test(t)) return t;
+  return CR_ASSET_BASE + t.replace(/^\/+/, "");
+}
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -59,7 +72,8 @@ export async function whopCookieHeader(device_id: string): Promise<string> {
   return header;
 }
 
-async function crFetch(
+/** Shared fetch helper for contentrewards.com (cookies NEVER logged). */
+export async function crFetch(
   path: string,
   opts: {
     method?: string;
@@ -319,6 +333,7 @@ export function detailToCampaign(d: CampaignDetail, prev: Campaign | null): Camp
     budget_remaining: d.budgetRemaining,
     payout_per_1k: rate || prev?.payout_per_1k || 0,
     joined: prev?.joined ?? false,
+    requiresApplication: d.requiresApplication,
     requirements: extraction.complete ? extraction.requirements : prev?.requirements ?? null,
     created_at: prev?.created_at ?? now,
     updated_at: now,
@@ -337,10 +352,16 @@ export function cardToCampaign(c: DiscoverCard, prev: Campaign | null): Campaign
     budget_remaining: c.availableBudget,
     payout_per_1k: (rateMatch ? parseFloat(rateMatch[0]) : c.payoutSortRaw) || prev?.payout_per_1k || 0,
     joined: prev?.joined ?? false,
+    requiresApplication: c.requiresApplication,
     requirements: prev?.requirements ?? null,
     created_at: prev?.created_at ?? now,
     updated_at: now,
   };
+}
+
+/** Re-parse an API search hit as a CampaignDetail (structured brief source). */
+export async function getApiDetail(campaignId: string) {
+  return getCampaignFromApi(campaignId);
 }
 
 export interface ApiResult<T = unknown> {
