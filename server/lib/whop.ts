@@ -80,6 +80,7 @@ export async function crFetch(
     cookieHeader?: string;
     json?: unknown;
     referer?: string;
+    bearer?: string;
   } = {}
 ): Promise<Response> {
   const ctrl = new AbortController();
@@ -100,6 +101,7 @@ export async function crFetch(
       headers["Origin"] = CR_BASE;
     }
     if (opts.referer) headers["Referer"] = opts.referer;
+    if (opts.bearer) headers["Authorization"] = `Bearer ${opts.bearer}`;
     const res = await fetch(CR_BASE + path, {
       method: opts.method ?? (opts.json !== undefined ? "POST" : "GET"),
       headers,
@@ -378,6 +380,16 @@ async function authedApi<T>(
   json?: unknown
 ): Promise<ApiResult<T>> {
   const cookieHeader = await whopCookieHeader(device_id);
+  // Content Rewards API may want the access token as a Bearer header
+  // instead of (or in addition to) cookies. Extract it from the cookie jar.
+  let bearer: string | null = null;
+  for (const part of cookieHeader.split(";")) {
+    const [k, ...rest] = part.trim().split("=");
+    if (k === "whop-core.access-token") {
+      bearer = rest.join("=").trim();
+      break;
+    }
+  }
   let res: Response;
   try {
     res = await crFetch(apiPath, {
@@ -385,6 +397,7 @@ async function authedApi<T>(
       cookieHeader,
       json,
       referer: `${CR_BASE}/discover`,
+      bearer: bearer ?? undefined,
     });
   } catch (e) {
     throw new WhopError(`whop api unreachable: ${e instanceof Error ? e.message : "network error"}`, 502);
