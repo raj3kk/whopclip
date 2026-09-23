@@ -43,6 +43,12 @@ type Submission = {
   id: string; campaign_name: string; ig_post_url: string; status: string;
   payout_per_1k: number; views: number | null; earned_usd: number | null; created_at: string;
 };
+type ChainInfo = {
+  id: string; campaign_id: string; campaign_name: string; stage: string;
+  status: string; attempts: number; error: string | null;
+  ig_post_url: string | null; updated_at: string; created_at: string;
+};
+const CHAIN_STAGES = ["check", "join", "render", "post", "verify", "submit", "done"];
 
 async function jget(url: string) {
   const r = await fetch(url);
@@ -71,6 +77,7 @@ export default function Dashboard() {
   const [campaigns, setCampaigns] = useState<Campaign[] | null>(null);
   const [campaignsErr, setCampaignsErr] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [chains, setChains] = useState<ChainInfo[]>([]);
   const [subs, setSubs] = useState<Submission[]>([]);
   const [earned, setEarned] = useState(0);
   const [pending, setPending] = useState(0);
@@ -95,12 +102,14 @@ export default function Dashboard() {
     const dev = devs.find((x) => x.device_id === sel);
     if (dev) { setSchedTime(dev.schedule.time); setSchedOn(dev.schedule.enabled); }
     if (!sel) return;
-    const [c, jb, e, s] = await Promise.all([
+    const [c, jb, e, s, ch] = await Promise.all([
       jget(`/api/campaigns?device_id=${encodeURIComponent(sel)}`),
       jget(`/api/jobs?device_id=${encodeURIComponent(sel)}`),
       jget(`/api/earnings?device_id=${encodeURIComponent(sel)}`),
       jget(`/api/sessions/status?device_id=${encodeURIComponent(sel)}`),
+      jget(`/api/chains?device_id=${encodeURIComponent(sel)}`),
     ]);
+    if (ch.ok) setChains(ch.j.chains ?? []);
     if (c.ok) { setCampaigns(c.j.campaigns); setCampaignsErr(null); }
     else { setCampaigns(null); setCampaignsErr(c.j.error || `HTTP ${c.status}`); }
     if (jb.ok) setJobs(jb.j.jobs ?? []);
@@ -135,7 +144,7 @@ export default function Dashboard() {
       body.video_url = videoUrl[c.id] || "";
     }
     if (step === "submit") {
-      const lastPost = jobs.find((j) => j.type === "ig_post" && j.status === "done");
+      const lastPost = jobs.find((j) => (j.type === "ig_post" || j.type === "server_post") && j.status === "done");
       const r = (lastPost?.result ?? {}) as Record<string, unknown>;
       body.ig_post_url = typeof r.post_url === "string" ? r.post_url : "";
     }
@@ -184,6 +193,19 @@ export default function Dashboard() {
     else {
       const cc = (j as { campaign?: { name?: string; joined?: boolean; budget_remaining?: number } }).campaign ?? {};
       alert(`${cc.name ?? c.name}: joined=${cc.joined ? "haan" : "nahi"}, budget $${cc.budget_remaining ?? "?"}`);
+      load();
+    }
+  }
+
+  async function pumpChains() {
+    setBusy("pump");
+    const r = await jget(`/api/chains/advance?device_id=${encodeURIComponent(deviceId)}`);
+    setBusy(null);
+    if (!r.ok) alert("Pump failed: " + (r.j.error || r.status));
+    else {
+      const list = (r.j.chains ?? []) as ChainInfo[];
+      const summ = list.map((c) => `${c.campaign_name}: ${c.stage} (${c.status})`).join("\n") || "koi active chain nahi";
+      alert(`⛓️ Chains pumped:\n${summ}`);
       load();
     }
   }
@@ -310,9 +332,9 @@ export default function Dashboard() {
       )}
 
       <div className="tabs">
-        {(["campaigns", "live", "jobs", "earnings", "phone"] as const).map((t) => (
+        {(["campaigns", "chains", "live", "jobs", "earnings", "phone"] as const).map((t) => (
           <button key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-            {t === "campaigns" ? "🎯 Campaigns" : t === "live" ? "🔴 Live" : t === "jobs" ? `⚙️ Jobs (${jobs.filter((j) => j.status === "queued" || j.status === "running").length})` : t === "earnings" ? `💰 Earnings ($${earned.toFixed(2)})` : "📱 Phone"}
+            {t === "campaigns" ? "🎯 Campaigns" : t === "chains" ? `⛓️ Chains (${chains.length})` : t === "live" ? "🔴 Live" : t === "jobs" ? `⚙️ Jobs (${jobs.filter((j) => j.status === "queued" || j.status === "running").length})` : t === "earnings" ? `💰 Earnings ($${earned.toFixed(2)})` : "📱 Phone"}
           </button>
         ))}
       </div>
@@ -373,7 +395,7 @@ export default function Dashboard() {
                   <option value="post">Post Reel</option>
                   <option value="submit">Submit to Whop</option>
                 </select>
-                <button className="btn small green" disabled={busy === c.id || !dev?.online} onClick={() => runNow(c)}>
+                <button className="btn small green" disabled={busy === c.id} onClick={() => runNow(c)}>
                   {busy === c.id ? "…" : "▶ Run Now"}
                 </button>
                 <button className="btn small ghost" disabled={busy === "check-" + c.id} onClick={() => serverCheck(c)}>
@@ -391,6 +413,58 @@ export default function Dashboard() {
               )}
             </div>
           ))}
+        </>
+      )}
+
+      {tab === "chains" && (
+        <>
+          <div className="card">
+            <h3 style={{ marginTop: 0 }}>⛓️ Server-side chains</h3>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+              <button className="btn small green" disabled={busy === "pump"} onClick={pumpChains}>
+                {busy === "pump" ? "…" : "▶ Pump chains now"}
+              </button>
+              <span className="muted" style={{ fontSize: 13 }}>
+                Sab stages server (USA) pe chalte hain — check → join → render → post → verify → submit.
+                Phone ka poll har 15 min me auto-pump karta hai.
+              </span>
+            </div>
+          </div>
+          {chains.length === 0 && (
+            <div className="card muted">Koi active chain nahi. Campaigns tab se “▶ Run Now” (Full) dabao.</div>
+          )}
+          {chains.map((ch) => {
+            const stageIdx = CHAIN_STAGES.indexOf(ch.stage);
+            return (
+              <div className="card" key={ch.id}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <b style={{ fontSize: 16, flex: 1 }}>{ch.campaign_name}</b>
+                  <span className={`badge ${ch.status === "failed" ? "red" : ch.status === "done" ? "green" : "blue"}`}>{ch.status}</span>
+                  {ch.attempts > 0 && <span className="badge yellow">attempt {ch.attempts}/3</span>}
+                </div>
+                <div style={{ display: "flex", gap: 4, margin: "12px 0", flexWrap: "wrap" }}>
+                  {CHAIN_STAGES.map((s, i) => (
+                    <span
+                      key={s}
+                      className={`badge ${i < stageIdx ? "green" : i === stageIdx ? (ch.status === "failed" ? "red" : "blue") : "grey"}`}
+                      style={{ fontSize: 11 }}
+                    >
+                      {i < stageIdx ? "✓ " : ""}{s}
+                    </span>
+                  ))}
+                </div>
+                {ch.error && <div className="alert warn" style={{ fontSize: 13 }}>⚠️ {ch.error}</div>}
+                {ch.ig_post_url && (
+                  <div style={{ fontSize: 13, marginTop: 6 }}>
+                    📸 <a href={ch.ig_post_url} target="_blank" rel="noreferrer">{ch.ig_post_url}</a>
+                  </div>
+                )}
+                <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                  updated {timeAgo(ch.updated_at)} · id <code>{ch.id.slice(0, 8)}</code>
+                </div>
+              </div>
+            );
+          })}
         </>
       )}
 

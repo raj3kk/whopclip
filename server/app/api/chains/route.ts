@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCampaign } from "@/lib/store";
 import {
   activeChain,
+  listActiveChains,
   listChains,
   startChain,
   type Chain,
@@ -25,13 +26,14 @@ export async function GET(req: NextRequest) {
   }
   const device_id = req.nextUrl.searchParams.get("device_id") ?? "";
   const campaign_id = req.nextUrl.searchParams.get("campaign_id") ?? "";
-  if (!device_id || !campaign_id) {
-    return NextResponse.json(
-      { error: "device_id and campaign_id required" },
-      { status: 400 }
-    );
+  if (!device_id) {
+    return NextResponse.json({ error: "device_id required" }, { status: 400 });
   }
-  const chains = await listChains(device_id, campaign_id);
+  // device-level: all active chains (dashboard Chains tab).
+  // device+campaign: full history for that campaign.
+  const chains = campaign_id
+    ? await listChains(device_id, campaign_id)
+    : await listActiveChains(device_id);
   return NextResponse.json({ chains });
 }
 

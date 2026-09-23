@@ -9,25 +9,24 @@ import crypto from "crypto";
 import {
   enqueueJob,
   getCampaign,
-  getJob,
   listCampaigns,
   selectCampaign,
   upsertCampaign,
+  recordSubmission,
   type Campaign,
   type Job,
+  type Submission,
 } from "./store";
 import { extractRequirementsFromText } from "./requirements";
 import { buildRenderSpec, enqueueRender, getRender } from "./render";
-import {
-  checkJoinJob,
-  joinJob,
-  igPostJob,
-  whopSubmitJob,
-} from "./jobs";
 import { startChain, type Chain } from "./chain";
 import {
   discoverCampaigns,
   cardToCampaign,
+  getCampaignDetail,
+  probeJoinState,
+  applyToCampaign,
+  createSubmission,
 } from "./whop";
 import { verifyReel } from "./instagram";
 import { logActivity } from "./store";
@@ -95,21 +94,28 @@ export async function enqueueRunStep(
   }
 
   const now = new Date().toISOString();
-  const mkJob = (
+
+  /**
+   * Marker job for a step that ran on the server: status done immediately,
+   * result embedded. The dashboard reads these exactly like phone jobs.
+   */
+  const serverMarker = (
     type: string,
-    steps: Record<string, unknown>[],
-    extra: Partial<Job> = {}
+    device_id: string,
+    campaign_id: string | undefined,
+    result: unknown,
+    nowIso: string
   ): Job => ({
-    id: crypto.randomUUID(),
+    id: `server-${crypto.randomUUID()}`,
     device_id,
     type,
-    status: "queued",
-    steps,
-    payload: extra.payload,
-    campaign_id: extra.campaign_id,
-    result: null,
-    created_at: now,
-    updated_at: now,
+    status: "done",
+    steps: [{ action: type }],
+    payload: campaign_id ? { campaign_id } : undefined,
+    campaign_id,
+    result,
+    created_at: nowIso,
+    updated_at: new Date().toISOString(),
   });
 
   // ---- Server-side discover helper ----
@@ -174,22 +180,81 @@ export async function enqueueRunStep(
     );
   }
 
-  let job: Job;
   switch (step) {
     case "discover": {
       // Server-side discover (Vercel USA) — no phone job, no discover_url
       // needed. The rewards site embeds campaign cards in the SSR payload.
       return serverDiscover();
     }
-    case "check":
-      job = mkJob("whop_check_join", checkJoinJob(campaign));
-      break;
-    case "join":
+    case "check": {
+      // Server-side (Vercel USA): campaign detail + join-state probe +
+      // requirements extraction. No phone WebView.
+      const detail = await getCampaignDetail(campaign.id);
+      const briefText = [detail.name, detail.description, ...detail.contentRequirements]
+        .filter(Boolean)
+        .join("\n");
+      if (briefText.trim().length < 50) {
+        throw new RunError(422, "check: campaign detail has no usable requirements text");
+      }
+      const extraction = extractRequirementsFromText(briefText);
+      const joinProbe = await probeJoinState(device_id, campaign.id);
+      const result = {
+        campaign: { id: detail.id, name: detail.name, active: detail.status },
+        requirements_complete: extraction.complete,
+        missing: extraction.missing,
+        join_state:
+          joinProbe.joined === true ? "joined" : joinProbe.joined === false ? "not_joined" : "unknown",
+        join_detail: joinProbe.detail,
+      };
+      if (!extraction.complete) {
+        throw new RunError(
+          422,
+          `check: incomplete requirements (${extraction.missing.join("; ")})`
+        );
+      }
+      await upsertCampaign({
+        ...campaign,
+        name: detail.name || campaign.name,
+        requirements: extraction.requirements,
+        joined: joinProbe.joined === true || campaign.joined === true,
+        updated_at: now,
+      });
+      await logActivity(
+        device_id,
+        "server_check",
+        `Server check: ${campaign.name} — join=${result.join_state}, requirements ok`
+      );
+      return {
+        job: serverMarker("server_check", device_id, campaign.id, result, now),
+        campaign,
+        server_result: result,
+      };
+    }
+    case "join": {
+      // Server-side (Vercel USA): apply API + join-state confirmation.
       if (campaign.joined) {
         throw new RunError(409, "campaign already joined");
       }
-      job = mkJob("whop_join", joinJob(campaign));
-      break;
+      const res = await applyToCampaign(device_id, campaign.id, {});
+      if (!res.ok) {
+        throw new RunError(
+          502,
+          `join rejected (HTTP ${res.status}): ${res.error ?? "no detail"}`
+        );
+      }
+      const probe = await probeJoinState(device_id, campaign.id);
+      if (probe.joined !== true) {
+        throw new RunError(502, `join API ok but join state unconfirmed (${probe.detail})`);
+      }
+      await upsertCampaign({ ...campaign, joined: true, updated_at: now });
+      const result = { joined: true, detail: probe.detail };
+      await logActivity(device_id, "server_join", `Server join: ${campaign.name} — joined ✓`);
+      return {
+        job: serverMarker("server_join", device_id, campaign.id, result, now),
+        campaign,
+        server_result: result,
+      };
+    }
     case "render": {
       // Server-side: parse the brief text (from a completed check job's
       // requirements_text) and enqueue a render spec for the VM worker.
@@ -215,15 +280,14 @@ export async function enqueueRunStep(
       });
       await enqueueRender(spec);
       // Return a marker job so the dashboard can track render state.
-      job = mkJob("render_clip", [], {
-        payload: { render_id: spec.id },
-        campaign_id: campaign.id,
-      });
       // render_clip jobs are server-side; mark done immediately — the VM
       // worker picks up the spec via /api/render/next.
-      job.status = "done";
-      job.result = { render_id: spec.id, status: "queued" };
-      break;
+      const renderResult = { render_id: spec.id, status: "queued" };
+      return {
+        job: serverMarker("render_clip", device_id, campaign.id, renderResult, now),
+        campaign,
+        server_result: renderResult,
+      };
     }
     case "verify": {
       const ig_post_url =
@@ -281,43 +345,101 @@ export async function enqueueRunStep(
       return { job: vjob, campaign, server_result: vjob.result };
     }
     case "post": {
+      // Server-side (Vercel USA): Instagram reel upload via the saved IG
+      // session (lib/igpost). The phone never posts.
       const caption = typeof opts.caption === "string" ? opts.caption : "";
       const video_url = typeof opts.video_url === "string" ? opts.video_url : "";
       if (!caption || !video_url) {
         throw new RunError(400, "caption and video_url required for post step");
       }
-      job = mkJob(
-        "ig_post",
-        igPostJob({ caption, video_hint: video_url }),
-        { payload: { video_url }, campaign_id: campaign.id }
-      );
-      break;
+      const { postReelToInstagram } = await import("./igpost");
+      const { createHash } = await import("node:crypto");
+      // Standalone run step has no chain — derive a deterministic idempotency
+      // key so re-running the same video+caption resumes instead of re-posting.
+      const idem = createHash("sha1")
+        .update(`${device_id}|${video_url}|${caption}`)
+        .digest("hex")
+        .slice(0, 16);
+      const res = await postReelToInstagram(device_id, `run-post:${idem}`, video_url, caption);
+      if (res.phase === "uploading" || res.phase === "transcoding" || res.phase === "busy") {
+        throw new RunError(
+          202,
+          `instagram upload in progress (phase: ${res.phase}) — re-run this step to continue`
+        );
+      }
+      if (!res.ok || !res.post_url) {
+        throw new RunError(502, `instagram upload failed: ${res.error ?? "no post_url"}`);
+      }
+      const result = { post_url: res.post_url, media_id: res.media_id ?? null };
+      await logActivity(device_id, "server_post", `Server post: ${res.post_url}`);
+      return {
+        job: serverMarker("server_post", device_id, campaign.id, result, now),
+        campaign,
+        server_result: result,
+      };
     }
     case "submit": {
+      // Server-side (Vercel USA): createSubmission API + recordSubmission.
       const ig_post_url =
         typeof opts.ig_post_url === "string" ? opts.ig_post_url : "";
       if (!ig_post_url) {
         throw new RunError(400, "ig_post_url required for submit step");
       }
-      job = mkJob(
-        "whop_submit",
-        whopSubmitJob({ campaign_url: campaign.whop_url, ig_post_url }),
-        { payload: { ig_post_url }, campaign_id: campaign.id }
+      const res = await createSubmission(device_id, {
+        campaignId: campaign.id,
+        platform: "instagram",
+        url: ig_post_url,
+      });
+      if (!res.ok) {
+        throw new RunError(
+          502,
+          `submit rejected (HTTP ${res.status}): ${res.error ?? "no detail"}`
+        );
+      }
+      const sub: Submission = {
+        id: crypto.randomUUID(),
+        device_id,
+        campaign_id: campaign.id,
+        campaign_name: campaign.name,
+        ig_post_url,
+        status: "pending",
+        payout_per_1k: campaign.payout_per_1k ?? 0,
+        views: null,
+        earned_usd: null,
+        created_at: now,
+      };
+      await recordSubmission(sub);
+      const result = { submitted: true, submission_id: sub.id, ig_post_url };
+      await logActivity(
+        device_id,
+        "server_submit",
+        `Server submit: ${campaign.name} — ${ig_post_url}`
       );
-      break;
+      return {
+        job: serverMarker("server_submit", device_id, campaign.id, result, now),
+        campaign,
+        server_result: result,
+      };
     }
     case "full":
     default: {
-      // full = startChain(): enqueues the check job AND registers the chain,
-      // so job completions auto-advance check->join->render->post->verify->submit.
-      // startChain throws on already-active/already-submitted (fail-closed).
+      // full = startChain(): runs check->join->render on the server NOW
+      // (render parks on the VM worker; /api/render/result resumes the
+      // chain into post->verify->submit->done). The phone runs nothing.
+      // startChain throws on already-active/already-submitted/daily-limit.
       const chain = await startChain(device_id, campaign);
-      const checkJob = await getJob(chain.job_id ?? "");
-      if (!checkJob) throw new RunError(500, "chain started but check job missing");
-      return { job: checkJob, campaign, chain };
+      const result = {
+        chain_id: chain.id,
+        stage: chain.stage,
+        status: chain.status,
+        error: chain.error,
+      };
+      return {
+        job: serverMarker("server_chain", device_id, campaign.id, result, now),
+        campaign,
+        chain,
+        server_result: result,
+      };
     }
   }
-
-  await enqueueJob(job);
-  return { job, campaign };
 }

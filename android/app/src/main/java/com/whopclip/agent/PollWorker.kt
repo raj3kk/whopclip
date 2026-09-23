@@ -48,6 +48,7 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
                 return@withContext Result.success()
             }
             ensureSessionsOnServer()
+            pumpServerChains()
             val job = claimJob() ?: return@withContext Result.success()
             Log.i(TAG, "claimed job ${job.optString("id")} type=${job.optString("type")}")
             try {
@@ -100,7 +101,7 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
         )
         val notif = NotificationCompat.Builder(ctx, PollService.CHANNEL_ID)
             .setContentTitle("WhopClip background me chal raha hai")
-            .setContentText("Automation jobs ka wait ho raha hai")
+            .setContentText("Server automation ke liye login session ready")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pi)
             .setOngoing(true)
@@ -121,10 +122,12 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
                 JSONObject(conn.inputStream.bufferedReader().readText())
             } finally { conn.disconnect() }
             val services = body.optJSONObject("services") ?: return
+            val staleServices = mutableListOf<String>()
             for (svc in listOf("whop", "instagram")) {
                 val info = services.optJSONObject(svc) ?: continue
                 val linkedLocal = if (svc == "whop") SessionManager.isWhopLinked(applicationContext)
                 else SessionManager.isIgLinked(applicationContext)
+                if (info.optBoolean("stale", false) && linkedLocal) staleServices.add(svc)
                 if (linkedLocal && !info.optBoolean("linked", false)) {
                     val page = if (svc == "whop") "https://whop.com/" else "https://www.instagram.com/"
                     Log.i(TAG, "re-uploading $svc session (server forgot it)")
@@ -134,8 +137,82 @@ class PollWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, 
                     }
                 }
             }
+            // Session expiry alert: server marked a linked session stale ->
+            // notify once per stale episode so the user re-logs in.
+            notifyLoginAgain(staleServices)
         } catch (e: Exception) {
             Log.w(TAG, "ensureSessions failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Drive server-side chains. The server runs every chain stage; the
+     * phone's poll is the retry driver (Vercel Hobby allows only one
+     * cron/day, so long stages like `post` retry from here).
+     */
+    private fun pumpServerChains() {
+        try {
+            val deviceId = SessionManager.deviceId(applicationContext)
+            val url = "${SessionManager.serverUrl(applicationContext)}/api/chains/advance?device_id=$deviceId"
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 20000; readTimeout = 90000
+            }
+            val code = conn.responseCode
+            val body = try {
+                conn.inputStream.bufferedReader().readText()
+            } catch (_: Exception) { "" } finally { conn.disconnect() }
+            if (code !in 200..299) {
+                Log.w(TAG, "chain pump: HTTP $code")
+                return
+            }
+            val n = try { JSONObject(body).optJSONArray("chains")?.length() ?: 0 } catch (_: Exception) { 0 }
+            if (n > 0) Log.i(TAG, "chain pump: $n active chain(s) advanced")
+        } catch (e: Exception) {
+            Log.w(TAG, "pumpServerChains failed: ${e.message}")
+        }
+    }
+
+    /**
+     * "Dobara login karo" alert. Fires once per stale episode (tracked in
+     * prefs); clears when the session is fresh again. Tapping opens the app.
+     */
+    private fun notifyLoginAgain(staleServices: List<String>) {
+        try {
+            val ctx = applicationContext
+            val prefs = ctx.getSharedPreferences("whopclip", Context.MODE_PRIVATE)
+            val key = "notified_stale"
+            val cur = staleServices.sorted().joinToString(",")
+            if (cur == (prefs.getString(key, "") ?: "")) return
+            prefs.edit().putString(key, cur).apply()
+            if (staleServices.isEmpty()) return
+            val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                mgr.createNotificationChannel(
+                    NotificationChannel(
+                        "whopclip_login", "WhopClip login alerts",
+                        NotificationManager.IMPORTANCE_HIGH
+                    )
+                )
+            }
+            val intent = Intent(ctx, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            val pi = PendingIntent.getActivity(
+                ctx, 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val names = staleServices.joinToString(" + ") { if (it == "whop") "Whop" else "Instagram" }
+            val notif = NotificationCompat.Builder(ctx, "whopclip_login")
+                .setContentTitle("🔐 WhopClip: dobara login karo")
+                .setContentText("$names ka session expire ho gaya — tap karke login karo")
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .build()
+            mgr.notify(2002, notif)
+            Log.i(TAG, "login-again notification shown for: $cur")
+        } catch (e: Exception) {
+            Log.w(TAG, "notifyLoginAgain failed: ${e.message}")
         }
     }
 

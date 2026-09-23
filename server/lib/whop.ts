@@ -343,7 +343,7 @@ export function cardToCampaign(c: DiscoverCard, prev: Campaign | null): Campaign
   };
 }
 
-interface ApiResult<T = unknown> {
+export interface ApiResult<T = unknown> {
   ok: boolean;
   status: number;
   data: T | null;

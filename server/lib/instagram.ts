@@ -13,10 +13,8 @@
  *  - igSessionInfo(): logged-in username probe (session health detail).
  *
  * What STAYS on the phone (deliberate):
- *  - ig_post (uploading the reel): the phone is the user's real device on
- *    their real IP. Posting from a datacenter server via reverse-engineered
- *    APIs is the fastest way to earn an action block. The upload itself is
- *    also interactive (file picker). So: phone posts, server verifies.
+ *  - interactive logins / 2FA for Whop + Instagram (session capture only),
+ *    and the "login again" notification when a session expires.
  *
  * Honest limit: burned-in caption POSITION (the 09-14 zoom bug) needs eyes.
  * Server verify checks the video is 9:16 per IG's own metadata; the visual

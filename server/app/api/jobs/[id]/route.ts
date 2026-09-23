@@ -133,9 +133,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       if (status === "done") {
         await onJobDone(job);
       } else if (status === "failed") {
-        const err =
-          typeof r.error === "string" ? r.error : "job failed (no error detail)";
-        await onJobFailed(job, err);
+        await onJobFailed(job);
       }
     } catch (e: unknown) {
       console.error("[chain] advance error:", e instanceof Error ? e.message : e);

@@ -1,1 +1,25 @@
-{"dependencies":{"next":"14.2.5","react":"18.3.1","react-dom":"18.3.1"},"devDependencies":{"@types/node":"20.14.0","@types/react":"18.3.3","typescript":"5.5.3"},"name":"whopclip-server","private":true,"scripts":{"build":"next build","dev":"next dev","start":"next start"},"version":"0.1.0"}
+{
+  "dependencies": {
+    "instagram-private-api": "^1.46.1",
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "sharp": "^0.35.4"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.0",
+    "@types/react": "18.3.3",
+    "typescript": "5.5.3"
+  },
+  "name": "whopclip-server",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev",
+    "start": "next start"
+  },
+  "version": "0.1.0",
+  "engines": {
+    "node": "24.x"
+  }
+}

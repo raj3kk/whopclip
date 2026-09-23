@@ -1,39 +1,59 @@
 /**
- * WhopClip chain engine — fully automatic campaign pipeline.
+ * WhopClip chain engine — FULLY SERVER-SIDE campaign pipeline.
  *
  * One chain per (device_id, campaign_id). Stages:
  *   check -> join -> render -> post -> verify -> submit -> done
  *
- * The phone and the VM worker only ever complete the job in front of them;
- * the server advances the chain:
- *   - POST /api/jobs/:id      (job done)  -> advanceChain()
- *   - POST /api/render/result (render ok) -> advanceChain() past render
+ * Every stage runs on the Vercel (USA) server using the phone-uploaded
+ * encrypted sessions (Whop + Instagram), decrypted only in server memory:
+ *   - check:  campaign detail + join-state probe + requirements extraction
+ *   - join:   applyToCampaign API
+ *   - render: VM render worker (async; parks here until /api/render/result)
+ *   - post:   Instagram reel upload from the server (lib/igpost)
+ *   - verify: server-side reel metadata verify (lib/instagram)
+ *   - submit: createSubmission API + recordSubmission
  *
- * Idempotent: a chain advances one stage at a time and only when the
- * completed job/render matches the chain's current stage. Re-deliveries and
- * retries are safe. Anything ambiguous fails the chain CLOSED with a reason
- * instead of guessing the next step.
+ * The phone's ONLY role is login/session upload: it never runs chain jobs.
+ *
+ * Advancement triggers (any of them may pump the chain; all idempotent):
+ *   - POST /api/run {step:"full"}          -> startChain -> pumpChain
+ *   - POST /api/render/result               -> onRenderDone -> pumpChain
+ *   - GET  /api/chains/advance?device_id=   -> pumpChain on every active chain
+ *       (called by the phone's PollWorker each poll + dashboard button;
+ *        Vercel Hobby allows only one cron/day, so the phone poll is the
+ *        retry driver for long stages like `post`.)
+ *
+ * Fail-closed: ambiguous join state, incomplete requirements, unverifiable
+ * post, failed verify, or failed submit stop the chain with a reason.
+ * Each stage gets MAX_STAGE_ATTEMPTS attempts; then the chain fails.
+ * Duplicate-post protection: a chain posts at most once. The igpost KV
+ * record (`igpost:<chain_id>`) is the point of no return: `configure` (the
+ * only publishing call) runs once per chain, concurrent pumps are
+ * serialized by a lock, and a chain that already has ig_post_url skips the
+ * post stage entirely.
  */
 import crypto from "crypto";
 import {
   alreadySubmitted,
-  enqueueJob,
   getCampaign,
-  getJob,
   kv,
+  recordSubmission,
   upsertCampaign,
+  earningsSummary,
   type Campaign,
   type Job,
+  type Submission,
 } from "./store";
 import { extractRequirementsFromText } from "./requirements";
 import { buildRenderSpec, enqueueRender, getRender } from "./render";
 import {
-  checkJoinJob,
-  joinJob,
-  igPostJob,
-  verifyReelJob,
-  whopSubmitJob,
-} from "./jobs";
+  getCampaignDetail,
+  probeJoinState,
+  applyToCampaign,
+  createSubmission,
+  type ApiResult,
+} from "./whop";
+import { verifyReel } from "./instagram";
 
 export type ChainStage =
   | "check"
@@ -53,14 +73,20 @@ export interface Chain {
   campaign_name: string;
   stage: ChainStage;
   status: ChainStatus;
-  /** job id currently executing this stage (phone-side stages) */
+  /** legacy: phone job id (no longer used for new chains) */
   job_id: string | null;
   /** render spec id (render stage) */
   render_id: string | null;
   /** extracted post URL (post stage output) */
   ig_post_url: string | null;
+  /** rendered video URL (render stage output) */
+  video_url: string | null;
+  /** built caption (render stage output) */
+  caption: string | null;
   /** parsed requirements (from check stage) */
   requirements_json: string | null;
+  /** attempts used on the current stage */
+  attempts: number;
   error: string | null;
   created_at: string;
   updated_at: string;
@@ -69,6 +95,9 @@ export interface Chain {
 const chainKey = (id: string) => `chain:${id}`;
 const chainIdxKey = (device_id: string, campaign_id: string) =>
   `chain_idx:${device_id}:${campaign_id}`;
+
+const MAX_STAGE_ATTEMPTS = 3;
+export const MAX_POSTS_PER_DAY = 4;
 
 async function getIdx(key: string): Promise<string[]> {
   const v = (await kv.get(key)) as unknown;
@@ -112,15 +141,26 @@ export async function activeChain(
   return chains.find((c) => c.status === "active") ?? null;
 }
 
-const STAGE_ORDER: ChainStage[] = [
-  "check",
-  "join",
-  "render",
-  "post",
-  "verify",
-  "submit",
-  "done",
-];
+/** All active chains for a device (pump driver iterates these). */
+export async function listActiveChains(device_id: string): Promise<Chain[]> {
+  // Bounded scan: chains are indexed per campaign; walk the campaigns.
+  const { listCampaigns } = await import("./store");
+  const campaigns = await listCampaigns();
+  const out: Chain[] = [];
+  for (const camp of campaigns) {
+    const c = await activeChain(device_id, camp.id);
+    if (c) out.push(c);
+  }
+  return out;
+}
+
+/** How many submissions this device made today (UTC date). */
+export async function countSubmissionsToday(device_id: string): Promise<number> {
+  const { submissions } = await earningsSummary(device_id);
+  const today = new Date().toISOString().slice(0, 10);
+  return submissions.filter((s) => (s.created_at ?? "").slice(0, 10) === today)
+    .length;
+}
 
 function failChain(c: Chain, error: string): Promise<void> {
   c.status = "failed";
@@ -128,34 +168,28 @@ function failChain(c: Chain, error: string): Promise<void> {
   return saveChain(c);
 }
 
-async function enqueuePhoneJob(
-  device_id: string,
-  campaign_id: string,
-  type: string,
-  steps: Record<string, unknown>[],
-  payload?: Record<string, unknown>
-): Promise<Job> {
-  const now = new Date().toISOString();
-  const job: Job = {
-    id: crypto.randomUUID(),
-    device_id,
-    type,
-    status: "queued",
-    steps,
-    payload,
-    campaign_id,
-    result: null,
-    created_at: now,
-    updated_at: now,
-  };
-  await enqueueJob(job);
-  return job;
+function bumpAttempt(c: Chain, error: string): Promise<void> {
+  c.attempts += 1;
+  c.error = error;
+  if (c.attempts >= MAX_STAGE_ATTEMPTS) {
+    return failChain(
+      c,
+      `stage "${c.stage}" failed ${c.attempts}x — last: ${error}`
+    );
+  }
+  return saveChain(c);
+}
+
+function resetAttempts(c: Chain): void {
+  c.attempts = 0;
+  c.error = null;
 }
 
 /**
  * Start a chain for a campaign. Fails closed when:
  * - a chain is already active for this device+campaign
  * - the campaign was already submitted by this device
+ * - the device already posted MAX_POSTS_PER_DAY times today
  * - no device_id
  */
 export async function startChain(
@@ -172,6 +206,12 @@ export async function startChain(
       `chain ${existing.id} already active at stage ${existing.stage}`
     );
   }
+  const todayCount = await countSubmissionsToday(device_id);
+  if (todayCount >= MAX_POSTS_PER_DAY) {
+    throw new Error(
+      `daily post limit reached (${todayCount}/${MAX_POSTS_PER_DAY}) — chain refused`
+    );
+  }
   const now = new Date().toISOString();
   const chain: Chain = {
     id: crypto.randomUUID(),
@@ -183,220 +223,452 @@ export async function startChain(
     job_id: null,
     render_id: null,
     ig_post_url: null,
+    video_url: null,
+    caption: null,
     requirements_json: null,
+    attempts: 0,
     error: null,
     created_at: now,
     updated_at: now,
   };
-  const job = await enqueuePhoneJob(
-    device_id,
-    campaign.id,
-    "whop_check_join",
-    checkJoinJob(campaign)
-  );
-  chain.job_id = job.id;
   await saveChain(chain);
-  return chain;
+  await pumpChain(chain);
+  return (await getChain(chain.id)) ?? chain;
 }
 
-function resultStr(result: unknown, key: string): string {
-  const r = (result ?? {}) as Record<string, unknown>;
-  const v = r[key];
-  if (typeof v === "string") return v;
-  return "";
+/* ------------------------------------------------------------------ */
+/* Stage implementations                                               */
+/* ------------------------------------------------------------------ */
+
+async function runCheckStage(chain: Chain): Promise<"advanced" | "failed"> {
+  const campaign = await getCampaign(chain.campaign_id);
+  if (!campaign) {
+    await failChain(chain, "campaign vanished mid-chain");
+    return "failed";
+  }
+  let detail;
+  try {
+    detail = await getCampaignDetail(chain.campaign_id);
+  } catch (e: unknown) {
+    await bumpAttempt(
+      chain,
+      `campaign detail fetch failed: ${e instanceof Error ? e.message : "unknown"}`
+    );
+    return "failed";
+  }
+  const briefText = [
+    detail.name,
+    detail.description,
+    ...detail.contentRequirements,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  if (briefText.trim().length < 50) {
+    await bumpAttempt(chain, "check produced no usable requirements text");
+    return "failed";
+  }
+  const extraction = extractRequirementsFromText(briefText);
+  if (!extraction.complete) {
+    await failChain(
+      chain,
+      `requirements incomplete: ${extraction.missing.join("; ")}`
+    );
+    return "failed";
+  }
+  const joinProbe = await probeJoinState(chain.device_id, chain.campaign_id);
+  const alreadyJoined = joinProbe.joined === true || campaign.joined === true;
+  chain.requirements_json = JSON.stringify({
+    requirements: extraction.requirements,
+    authorized_sources: extraction.authorized_sources,
+    title_templates: extraction.title_templates,
+  });
+  await upsertCampaign({
+    ...campaign,
+    name: detail.name || campaign.name,
+    requirements: extraction.requirements,
+    joined: alreadyJoined,
+    updated_at: new Date().toISOString(),
+  });
+  if (joinProbe.joined === null && !campaign.joined) {
+    await failChain(
+      chain,
+      `ambiguous join state — refusing to guess (${joinProbe.detail})`
+    );
+    return "failed";
+  }
+  resetAttempts(chain);
+  chain.stage = alreadyJoined ? "render" : "join";
+  await saveChain(chain);
+  return "advanced";
+}
+
+async function runJoinStage(chain: Chain): Promise<"advanced" | "failed"> {
+  const campaign = await getCampaign(chain.campaign_id);
+  if (!campaign) {
+    await failChain(chain, "campaign vanished mid-chain");
+    return "failed";
+  }
+  let res: ApiResult;
+  try {
+    res = await applyToCampaign(chain.device_id, chain.campaign_id, {});
+  } catch (e: unknown) {
+    await bumpAttempt(
+      chain,
+      `join request failed: ${e instanceof Error ? e.message : "unknown"}`
+    );
+    return "failed";
+  }
+  if (!res.ok) {
+    await bumpAttempt(
+      chain,
+      `join rejected (HTTP ${res.status}): ${res.error ?? "no detail"}`
+    );
+    return "failed";
+  }
+  // Confirm the join actually landed — probe again, fail closed on ambiguity.
+  const probe = await probeJoinState(chain.device_id, chain.campaign_id);
+  if (probe.joined !== true) {
+    await bumpAttempt(
+      chain,
+      `join API ok but join state unconfirmed (${probe.detail})`
+    );
+    return "failed";
+  }
+  await upsertCampaign({
+    ...campaign,
+    joined: true,
+    updated_at: new Date().toISOString(),
+  });
+  resetAttempts(chain);
+  chain.stage = "render";
+  await saveChain(chain);
+  return "advanced";
+}
+
+async function runRenderStage(
+  chain: Chain
+): Promise<"advanced" | "parked" | "failed"> {
+  if (chain.render_id) {
+    // Already enqueued — waiting on the VM worker callback.
+    return "parked";
+  }
+  const campaign = await getCampaign(chain.campaign_id);
+  if (!campaign) {
+    await failChain(chain, "campaign vanished mid-chain");
+    return "failed";
+  }
+  const parsed = JSON.parse(chain.requirements_json ?? "{}");
+  const spec = buildRenderSpec(chain.device_id, campaign, parsed.requirements, {
+    authorized_sources: parsed.authorized_sources ?? [],
+    title_templates: parsed.title_templates ?? [],
+  });
+  await enqueueRender(spec);
+  chain.render_id = spec.id;
+  resetAttempts(chain);
+  await saveChain(chain);
+  return "parked"; // /api/render/result resumes the chain
+}
+
+async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
+  // Duplicate-post protection: never post twice for one chain. The igpost
+  // KV record (`igpost:<chain_id>`) is the point of no return — `configure`
+  // (the only publishing call) runs once per chain, and concurrent pumps
+  // are serialized by a lock.
+  if (chain.ig_post_url) {
+    resetAttempts(chain);
+    chain.stage = "verify";
+    await saveChain(chain);
+    return "advanced";
+  }
+  if (!chain.video_url || !/^https?:\/\//i.test(chain.video_url)) {
+    await failChain(chain, "post stage reached without a rendered video_url");
+    return "failed";
+  }
+  if (!chain.caption) {
+    await failChain(chain, "post stage reached without a caption");
+    return "failed";
+  }
+  const { postReelToInstagram } = await import("./igpost");
+  let res;
+  try {
+    res = await postReelToInstagram(
+      chain.device_id,
+      chain.id,
+      chain.video_url,
+      chain.caption
+    );
+  } catch (e: unknown) {
+    await bumpAttempt(
+      chain,
+      `instagram upload threw: ${e instanceof Error ? e.message : "unknown"}`
+    );
+    return "failed";
+  }
+  if (res.session_expired) {
+    // Definitive auth expiry — igpost already marked the session stale, so
+    // the phone shows "login again". This is terminal for the stage, not a
+    // transient attempt.
+    await bumpAttempt(chain, "instagram session expired — phone pe dobara login karo");
+    return "failed";
+  }
+  if (!res.ok) {
+    if (res.retryable) {
+      // Transient (rate limit, lock busy, timeout): park in the post stage
+      // WITHOUT consuming an attempt; the next pump retries.
+      chain.error = `instagram upload pending: ${res.error ?? "retryable"}`;
+      chain.updated_at = new Date().toISOString();
+      await saveChain(chain);
+      return "advanced"; // stage unchanged -> pump loop parks
+    }
+    await bumpAttempt(
+      chain,
+      `instagram upload failed: ${res.error ?? "no post_url"}`
+    );
+    return "failed";
+  }
+  if (res.phase === "uploading" || res.phase === "transcoding" || res.phase === "busy") {
+    // Multi-pump upload still in flight — park in the post stage.
+    chain.error = `instagram upload in progress (phase: ${res.phase})`;
+    chain.updated_at = new Date().toISOString();
+    await saveChain(chain);
+    return "advanced"; // stage unchanged -> pump loop parks
+  }
+  if (!res.post_url) {
+    await bumpAttempt(chain, "instagram upload returned ok but no post_url");
+    return "failed";
+  }
+  chain.ig_post_url = res.post_url;
+  chain.error = null;
+  resetAttempts(chain);
+  chain.stage = "verify";
+  await saveChain(chain);
+  return "advanced";
+}
+
+async function runVerifyStage(chain: Chain): Promise<"advanced" | "failed"> {
+  const campaign = await getCampaign(chain.campaign_id);
+  if (!campaign || !chain.ig_post_url) {
+    await failChain(chain, "verify stage reached without campaign/post URL");
+    return "failed";
+  }
+  const parsed = JSON.parse(chain.requirements_json ?? "{}");
+  const req = parsed.requirements ?? {};
+  const requiredTags = [
+    ...((req.required_mentions as string[]) ?? []),
+    ...((req.required_hashtags as string[]) ?? []),
+  ];
+  let vr;
+  try {
+    vr = await verifyReel(chain.device_id, chain.ig_post_url, {
+      required_tags: requiredTags,
+    });
+  } catch (e: unknown) {
+    await bumpAttempt(
+      chain,
+      `reel verify threw: ${e instanceof Error ? e.message : "unknown"}`
+    );
+    return "failed";
+  }
+  if (!vr.live) {
+    const failed = vr.checks.filter((c) => !c.ok).map((c) => `${c.name} (${c.detail})`);
+    await bumpAttempt(
+      chain,
+      `reel verify failed: ${failed.join("; ") || "reel not live"}`
+    );
+    return "failed";
+  }
+  resetAttempts(chain);
+  chain.stage = "submit";
+  await saveChain(chain);
+  return "advanced";
+}
+
+async function runSubmitStage(chain: Chain): Promise<"advanced" | "failed"> {
+  if (!chain.ig_post_url) {
+    await failChain(chain, "submit stage reached without ig_post_url");
+    return "failed";
+  }
+  let res: ApiResult;
+  try {
+    res = await createSubmission(chain.device_id, {
+      campaignId: chain.campaign_id,
+      platform: "instagram",
+      url: chain.ig_post_url,
+    });
+  } catch (e: unknown) {
+    await bumpAttempt(
+      chain,
+      `submit request failed: ${e instanceof Error ? e.message : "unknown"}`
+    );
+    return "failed";
+  }
+  if (!res.ok) {
+    await bumpAttempt(
+      chain,
+      `submit rejected (HTTP ${res.status}): ${res.error ?? "no detail"}`
+    );
+    return "failed";
+  }
+  const campaign = await getCampaign(chain.campaign_id);
+  const now = new Date().toISOString();
+  const sub: Submission = {
+    id: crypto.randomUUID(),
+    device_id: chain.device_id,
+    campaign_id: chain.campaign_id,
+    campaign_name: chain.campaign_name,
+    ig_post_url: chain.ig_post_url,
+    status: "pending",
+    payout_per_1k: campaign?.payout_per_1k ?? 0,
+    views: null,
+    earned_usd: null,
+    created_at: now,
+  };
+  await recordSubmission(sub);
+  resetAttempts(chain);
+  chain.stage = "done";
+  chain.status = "done";
+  await saveChain(chain);
+  return "advanced";
+}
+
+/* ------------------------------------------------------------------ */
+/* Pump: advance one chain through runnable stages                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Pump a chain forward through every stage that can run synchronously.
+ * Stops (parks) at `render` while the VM worker renders, or when the
+ * chain reaches done/failed. Idempotent — safe to call from any trigger.
+ */
+export async function pumpChain(chain: Chain): Promise<Chain> {
+  let c = (await getChain(chain.id)) ?? chain;
+  // Never pump a terminal chain.
+  if (c.status !== "active") return c;
+  for (let i = 0; i < 8 && c.status === "active"; i++) {
+    const before = c.stage;
+    let outcome: "advanced" | "parked" | "failed";
+    try {
+      switch (c.stage) {
+        case "check":
+          outcome = await runCheckStage(c);
+          break;
+        case "join":
+          outcome = await runJoinStage(c);
+          break;
+        case "render":
+          outcome = await runRenderStage(c);
+          break;
+        case "post":
+          outcome = await runPostStage(c);
+          break;
+        case "verify":
+          outcome = await runVerifyStage(c);
+          break;
+        case "submit":
+          outcome = await runSubmitStage(c);
+          break;
+        case "done":
+          c.status = "done";
+          await saveChain(c);
+          outcome = "advanced";
+          break;
+      }
+    } catch (e: unknown) {
+      await bumpAttempt(
+        c,
+        `stage "${c.stage}" threw: ${e instanceof Error ? e.message : "unknown"}`
+      );
+      outcome = "failed";
+    }
+    c = (await getChain(c.id)) ?? c;
+    if (outcome === "parked") break;
+    if (outcome === "failed") break; // retryable: keep stage, stop pumping
+    if (c.stage === before && outcome === "advanced") break; // no progress
+  }
+  return c;
+}
+
+/** Pump every active chain for a device (retry driver). */
+export async function pumpDeviceChains(device_id: string): Promise<Chain[]> {
+  const chains = await listActiveChains(device_id);
+  const out: Chain[] = [];
+  for (const ch of chains) {
+    try {
+      out.push(await pumpChain(ch));
+    } catch {
+      // One bad chain must not block the others.
+      out.push(ch);
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Callbacks                                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Advance a chain after the VM worker reported a render result.
+ * Called from POST /api/render/result. Only acts when the render id
+ * matches the chain's current render stage.
+ */
+export async function onRenderDone(
+  render_id: string,
+  ok: boolean,
+  video_url?: string
+): Promise<Chain | null> {
+  const spec = await getRender(render_id);
+  if (!spec) return null;
+  const chain = await activeChain(spec.device_id, spec.campaign_id);
+  if (!chain || chain.stage !== "render" || chain.render_id !== render_id) {
+    return chain;
+  }
+  if (!ok) {
+    await failChain(chain, "render worker failed (see render spec error)");
+    return chain;
+  }
+  if (!video_url || !/^https?:\/\//i.test(video_url)) {
+    await failChain(chain, "render ok but no video_url");
+    return chain;
+  }
+  const parsed = JSON.parse(chain.requirements_json ?? "{}");
+  const campaign = await getCampaign(chain.campaign_id);
+  const caption = buildCaption(parsed, campaign?.name ?? chain.campaign_name);
+  if (!caption) {
+    await failChain(chain, "render done but no caption could be built");
+    return chain;
+  }
+  chain.video_url = video_url;
+  chain.caption = caption;
+  chain.stage = "post";
+  await saveChain(chain);
+  return pumpChain(chain);
 }
 
 /**
- * Advance a chain after a phone job completed.
- * Called from POST /api/jobs/:id. Only acts when the finished job is the
- * chain's current stage job; anything else is ignored (idempotent).
+ * Mark the chain's current phone job as failed (legacy: new chains never
+ * enqueue phone jobs, so this only touches chains that still reference one).
  */
-export async function onJobDone(job: Job): Promise<Chain | null> {
+export async function onJobFailed(job: Job): Promise<Chain | null> {
   if (!job.campaign_id) return null;
   const chain = await activeChain(job.device_id, job.campaign_id);
   if (!chain || chain.job_id !== job.id) return null;
   if (chain.status !== "active") return chain;
-
-  const stageIdx = STAGE_ORDER.indexOf(chain.stage);
-
-  try {
-    switch (chain.stage) {
-      case "check": {
-        const joinState = resultStr(job.result, "join_state").toLowerCase();
-        const briefText = resultStr(job.result, "requirements_text");
-        if (briefText.length < 50) {
-          await failChain(chain, "check produced no usable requirements_text");
-          return chain;
-        }
-        const extraction = extractRequirementsFromText(briefText);
-        if (!extraction.complete) {
-          await failChain(
-            chain,
-            `requirements incomplete: ${extraction.missing.join("; ")}`
-          );
-          return chain;
-        }
-        chain.requirements_json = JSON.stringify({
-          requirements: extraction.requirements,
-          authorized_sources: extraction.authorized_sources,
-          title_templates: extraction.title_templates,
-        });
-        const campaign = await getCampaign(chain.campaign_id);
-        if (!campaign) {
-          await failChain(chain, "campaign vanished mid-chain");
-          return chain;
-        }
-        // Persist the parsed brief + join state on the campaign record so
-        // the dashboard and future runs see the ground truth.
-        const alreadyJoined = joinState === "joined" || campaign.joined;
-        await upsertCampaign({
-          ...campaign,
-          requirements: extraction.requirements,
-          joined: alreadyJoined,
-          updated_at: new Date().toISOString(),
-        });
-        if (alreadyJoined) {
-          // skip join -> straight to render
-          chain.stage = "render";
-          await enqueueRenderStage(chain, campaign, extraction);
-        } else if (joinState === "not_joined") {
-          chain.stage = "join";
-          const j = await enqueuePhoneJob(
-            chain.device_id,
-            chain.campaign_id,
-            "whop_join",
-            joinJob(campaign)
-          );
-          chain.job_id = j.id;
-          await saveChain(chain);
-        } else {
-          await failChain(
-            chain,
-            `ambiguous join_state "${joinState}" — refusing to guess`
-          );
-        }
-        return chain;
-      }
-
-      case "join": {
-        const campaign = await getCampaign(chain.campaign_id);
-        if (!campaign) {
-          await failChain(chain, "campaign vanished mid-chain");
-          return chain;
-        }
-        // The join job's js step throws unless the page shows a joined state,
-        // so reaching here means join succeeded — persist it.
-        await upsertCampaign({
-          ...campaign,
-          joined: true,
-          updated_at: new Date().toISOString(),
-        });
-        const parsed = JSON.parse(chain.requirements_json ?? "{}");
-        chain.stage = "render";
-        await enqueueRenderStage(chain, campaign, {
-          requirements: parsed.requirements,
-          authorized_sources: parsed.authorized_sources ?? [],
-          title_templates: parsed.title_templates ?? [],
-        });
-        return chain;
-      }
-
-      case "post": {
-        // Normalize: the phone reports `post_url`; accept `ig_post_url` too.
-        const postUrl =
-          resultStr(job.result, "post_url") || resultStr(job.result, "ig_post_url");
-        if (!/^https?:\/\//i.test(postUrl)) {
-          await failChain(chain, "post job finished without a valid post_url");
-          return chain;
-        }
-        chain.ig_post_url = postUrl;
-        chain.stage = "verify";
-        const j = await enqueuePhoneJob(
-          chain.device_id,
-          chain.campaign_id,
-          "ig_verify",
-          verifyReelJob(postUrl),
-          { ig_post_url: postUrl }
-        );
-        chain.job_id = j.id;
-        await saveChain(chain);
-        return chain;
-      }
-
-      case "verify": {
-        const campaign = await getCampaign(chain.campaign_id);
-        if (!campaign || !chain.ig_post_url) {
-          await failChain(chain, "verify done but campaign/post URL missing");
-          return chain;
-        }
-        // Fail-closed frame proof: the verify job must have uploaded all four
-        // live-reel frames (1s/7s/15s/25s). Missing proof = no submit.
-        const frameKeys = ["frame_1s.png", "frame_7s.png", "frame_15s.png", "frame_25s.png"];
-        const missingFrames = frameKeys.filter(
-          (k) => !/^https?:\/\//i.test(resultStr(job.result, `${k}_url`))
-        );
-        if (missingFrames.length > 0) {
-          await failChain(
-            chain,
-            `verify incomplete: missing frame uploads (${missingFrames.join(", ")})`
-          );
-          return chain;
-        }
-        chain.stage = "submit";
-        const j = await enqueuePhoneJob(
-          chain.device_id,
-          chain.campaign_id,
-          "whop_submit",
-          whopSubmitJob({
-            campaign_url: campaign.whop_url,
-            ig_post_url: chain.ig_post_url,
-          }),
-          { ig_post_url: chain.ig_post_url }
-        );
-        chain.job_id = j.id;
-        await saveChain(chain);
-        return chain;
-      }
-
-      case "submit": {
-        // submission recording happens in POST /api/jobs/:id already
-        chain.stage = "done";
-        chain.status = "done";
-        chain.job_id = null;
-        await saveChain(chain);
-        return chain;
-      }
-
-      default:
-        return chain;
-    }
-  } catch (e: unknown) {
-    await failChain(
-      chain,
-      `chain advance failed at ${chain.stage}: ${e instanceof Error ? e.message : "unknown"}`
-    );
-    return chain;
-  }
+  await failChain(
+    chain,
+    `phone job ${job.type} failed: ${JSON.stringify(job.result ?? {}).slice(0, 300)}`
+  );
+  return chain;
 }
 
-async function enqueueRenderStage(
-  chain: Chain,
-  campaign: Campaign,
-  extraction: {
-    requirements: unknown;
-    authorized_sources: string[];
-    title_templates: string[];
-  }
-): Promise<void> {
-  const { buildRenderSpec: build, enqueueRender: enq } = await import("./render");
-  const spec = build(chain.device_id, campaign, extraction.requirements as never, {
-    authorized_sources: extraction.authorized_sources,
-    title_templates: extraction.title_templates,
-  });
-  await enq(spec);
-  chain.render_id = spec.id;
-  chain.job_id = null; // render is VM-side, no phone job
-  await saveChain(chain);
+/** Legacy: phone jobs no longer drive new chains; kept for old in-flight jobs. */
+export async function onJobDone(job: Job): Promise<Chain | null> {
+  if (!job.campaign_id) return null;
+  const chain = await activeChain(job.device_id, job.campaign_id);
+  if (!chain || chain.job_id !== job.id) return null;
+  // New server-side chains have job_id = null, so this path only serves
+  // chains started before the server-side migration.
+  return chain;
 }
 
 /**
@@ -431,60 +703,4 @@ function buildCaption(
   ].filter((t, i, a) => t && a.indexOf(t) === i);
   if (tags.length) lines.push(tags.join(" "));
   return lines.join("\n").trim();
-}
-
-/**
- * Advance a chain after the VM worker reported a render result.
- * Called from POST /api/render/result. Only acts when the render id matches
- * the chain's current render stage.
- */
-export async function onRenderDone(
-  render_id: string,
-  ok: boolean,
-  video_url?: string
-): Promise<Chain | null> {
-  const spec = await getRender(render_id);
-  if (!spec) return null;
-  const chain = await activeChain(spec.device_id, spec.campaign_id);
-  if (!chain || chain.stage !== "render" || chain.render_id !== render_id) {
-    return chain;
-  }
-  if (!ok) {
-    await failChain(chain, "render worker failed (see render spec error)");
-    return chain;
-  }
-  if (!video_url || !/^https?:\/\//i.test(video_url)) {
-    await failChain(chain, "render ok but no video_url");
-    return chain;
-  }
-  const parsed = JSON.parse(chain.requirements_json ?? "{}");
-  const campaign = await getCampaign(chain.campaign_id);
-  const caption = buildCaption(parsed, campaign?.name ?? chain.campaign_name);
-  if (!caption) {
-    await failChain(chain, "render done but no caption could be built");
-    return chain;
-  }
-  chain.stage = "post";
-  const job = await enqueuePhoneJob(
-    chain.device_id,
-    chain.campaign_id,
-    "ig_post",
-    igPostJob({ caption, video_hint: video_url }),
-    { video_url }
-  );
-  chain.job_id = job.id;
-  await saveChain(chain);
-  return chain;
-}
-
-/**
- * Mark the chain's current phone job as failed (called when the job fails).
- * Fails the chain closed with the job's error.
- */
-export async function onJobFailed(job: Job, error: string): Promise<Chain | null> {
-  if (!job.campaign_id) return null;
-  const chain = await activeChain(job.device_id, job.campaign_id);
-  if (!chain || chain.job_id !== job.id) return null;
-  await failChain(chain, `stage ${chain.stage} job failed: ${error.slice(0, 300)}`);
-  return chain;
 }
