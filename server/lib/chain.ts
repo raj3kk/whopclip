@@ -439,8 +439,15 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
   // Gap G1 — budget exhaustion mid-chain: re-check the live budget right
   // before we spend a daily post slot. A campaign that hit $0 while the
   // chain was rendering must fail, not post.
+  // Timeout guard: the Content Rewards API can hang; 15s timeout then park
+  // (don't fail the chain on a network hiccup).
   try {
-    const live = await getApiDetail(chain.campaign_id);
+    const live = await Promise.race([
+      getApiDetail(chain.campaign_id),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("budget check timeout (15s)")), 15000)
+      ),
+    ]);
     if (live.budgetRemaining <= 0) {
       await failChain(
         chain,
@@ -453,10 +460,15 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
       return "failed";
     }
   } catch (e: unknown) {
-    await bumpAttempt(
-      chain,
-      `pre-post budget check failed: ${e instanceof Error ? e.message : "unknown"}`
-    );
+    const msg = e instanceof Error ? e.message : "unknown";
+    if (msg.includes("timeout")) {
+      // Park, don't fail — retry on next pump.
+      chain.error = `budget check timed out — parked, retry on next pump`;
+      chain.updated_at = new Date().toISOString();
+      await saveChain(chain);
+      return "advanced"; // stage unchanged -> pump loop parks
+    }
+    await bumpAttempt(chain, `pre-post budget check failed: ${msg}`);
     return "failed";
   }
   // Gap G2 — caption builder verification: every required @mention/#hashtag
