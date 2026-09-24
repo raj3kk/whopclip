@@ -19,13 +19,14 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 /**
- * v20: keeps login cookies flowing to the server automatically.
+ * v21: keeps login cookies flowing to the server automatically — now on a
+ * slow 6-hour cadence (user request 2026-09-24: aggressive per-minute sync
+ * stopped; sessions stay fresh without constant traffic).
  *
  * A foreground service (persistent notification) that re-syncs Instagram /
- * Whop / Content Rewards cookies every 60 seconds — the user never has to
- * tap "Session save". Only non-empty (valid) cookies are uploaded; a source
- * with no cookies is skipped so a logged-out page never wipes the last good
- * server-side jar.
+ * Whop / Content Rewards cookies every 6 hours. Only non-empty (valid)
+ * cookies are uploaded; a source with no cookies is skipped so a logged-out
+ * page never wipes the last good server-side jar.
  *
  * Started from MainActivity.onCreate and re-started on BOOT_COMPLETED /
  * MY_PACKAGE_REPLACED via BootReceiver.
@@ -34,7 +35,7 @@ class CookieSyncService : Service() {
     companion object {
         const val CHANNEL_ID = "whopclip_cookiesync"
         const val NOTIF_ID = 1002
-        const val INTERVAL_MS = 60_000L
+        const val INTERVAL_MS = 6 * 60 * 60 * 1000L // 6 hours
         private const val TAG = "CookieSyncService"
 
         fun start(ctx: Context) {
@@ -82,7 +83,7 @@ class CookieSyncService : Service() {
         startForeground(NOTIF_ID, buildNotif(null))
         handler = Handler(Looper.getMainLooper())
         handler?.post(tick)
-        Log.i(TAG, "cookie auto-sync started (60s)")
+        Log.i(TAG, "cookie auto-sync started (6h)")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -105,7 +106,7 @@ class CookieSyncService : Service() {
             }
         }
         val text = if (synced != null) "Last sync: $synced cookies server pe bheje ✓"
-                   else "Har 1 min me login cookies server pe sync honge"
+                   else "Har 6 ghante me login cookies server pe sync honge"
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("WhopClip cookie sync")
             .setContentText(text)
