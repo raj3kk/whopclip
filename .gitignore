@@ -9,3 +9,6 @@ server/tsconfig.tsbuildinfo
 server/.next/
 *.apk
 *.aab
+
+# Phase 0 migration export (production data, local only)
+worker/out/

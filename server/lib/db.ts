@@ -77,7 +77,76 @@ export interface KVBackend {
   cas(key: string, value: unknown, updatedAt: string): Promise<boolean>;
 }
 
-export const supabaseKV: KVBackend = {
+/**
+ * Extended backend with a raw row read (value + updated_at) for CAS flows.
+ * Both the Supabase and Turso backends implement this.
+ */
+export interface KVBackendEx extends KVBackend {
+  getWithTs(key: string): Promise<{ value: unknown; updated_at: string } | null>;
+}
+
+/* ---------------- cutover config (Phase 0) ----------------
+ * KV_READ_SOURCE: "supabase" (default) | "turso" — which backend serves reads.
+ * KV_WRITE_MODE:  "supabase" (default) | "dual" | "turso".
+ *   dual = write the read-source backend, then propagate to the other one.
+ * Rollback = set both back to "supabase" (today's exact behavior).
+ * NOTE: tursoKV lives in ./turso.ts (separate module to keep the import
+ * graph acyclic: turso.ts imports nextVersion/KVBackend from here).
+ */
+export type KVReadSource = "supabase" | "turso";
+export type KVWriteMode = "supabase" | "dual" | "turso";
+
+export function kvReadSource(): KVReadSource {
+  return process.env.KV_READ_SOURCE === "turso" ? "turso" : "supabase";
+}
+
+export function kvWriteMode(): KVWriteMode {
+  const m = process.env.KV_WRITE_MODE;
+  return m === "dual" || m === "turso" ? m : "supabase";
+}
+
+/**
+ * Dual-write wrapper: reads always come from `read`; every write also goes
+ * to each secondary. A secondary failure is logged loudly but never breaks
+ * the request (the read source is the source of truth; /api/internal/kv-reconcile
+ * reports drift). CAS propagation: after winning the primary CAS, propagate
+ * via the secondary's own getWithTs+cas, falling back to a plain set — safe
+ * because every writer goes through this same path (a primary-CAS loser never
+ * writes anywhere).
+ */
+export function dualKV(read: KVBackendEx, secondaries: KVBackendEx[]): KVBackend {
+  return {
+    async get(key: string) {
+      return read.get(key);
+    },
+    async set(key: string, value: unknown) {
+      await read.set(key, value);
+      for (const s of secondaries) {
+        try {
+          await s.set(key, value);
+        } catch (e) {
+          console.error(`[kv] dual-write secondary set failed key=${key}`, e);
+        }
+      }
+    },
+    async cas(key: string, value: unknown, updatedAt: string) {
+      const ok = await read.cas(key, value, updatedAt);
+      if (!ok) return false;
+      for (const s of secondaries) {
+        try {
+          const row = await s.getWithTs(key);
+          let done = row ? await s.cas(key, value, row.updated_at) : false;
+          if (!done) await s.set(key, value); // lost secondary race — converge
+        } catch (e) {
+          console.error(`[kv] dual-write secondary cas failed key=${key}`, e);
+        }
+      }
+      return true;
+    },
+  };
+}
+
+export const supabaseKV: KVBackendEx = {
   async get(key: string) {
     const full = `whopclip:${key}`;
     const { status, json } = await sb(
@@ -139,5 +208,17 @@ export const supabaseKV: KVBackend = {
     );
     if (status !== 200) return false;
     return Array.isArray(json) && json.length > 0;
+  },
+
+  /** Raw row read (value + updated_at) for CAS flows. */
+  async getWithTs(key: string) {
+    const full = `whopclip:${key}`;
+    const { status, json } = await sb(
+      "GET",
+      `/rest/v1/flipify_kv?device_id=eq.${DEVICE}&key=eq.${encodeURIComponent(full)}&select=value,updated_at`
+    );
+    if (status !== 200 || !Array.isArray(json) || json.length === 0) return null;
+    const row = json[0] as { value: unknown; updated_at: string };
+    return { value: row.value ?? null, updated_at: row.updated_at };
   },
 };

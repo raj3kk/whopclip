@@ -15,7 +15,17 @@
  *   submissions:{device_id}         string[] (submission ids)
  */
 
-import { dbEnabled, nextVersion, supabaseKV, type KVBackend } from "./db";
+import {
+  dbEnabled,
+  nextVersion,
+  supabaseKV,
+  dualKV,
+  kvReadSource,
+  kvWriteMode,
+  type KVBackend,
+  type KVBackendEx,
+} from "./db";
+import { tursoKV, tursoEnabled, tursoGetWithTs } from "./turso";
 import crypto from "crypto";
 
 export type ServiceName = "whop" | "instagram";
@@ -126,39 +136,66 @@ class MemoryKV implements KVBackend {
 }
 
 const mem = new MemoryKV();
-const kv: KVBackend = dbEnabled ? supabaseKV : mem;
+
+/* ---- Phase 0 cutover: read-source + write-mode aware backend ----
+ * Defaults (no env set): read supabase, write supabase — today's exact behavior.
+ * Dual phase:   KV_WRITE_MODE=dual   (reads supabase, writes both)
+ * Read switch:  KV_READ_SOURCE=turso + KV_WRITE_MODE=dual
+ * Rollback:     unset both (or set back to supabase/supabase).
+ * Turso is only used when TURSO_AUTH_TOKEN is set (tursoEnabled).
+ */
+function buildBackends(): { read: KVBackendEx | null; kv: KVBackend } {
+  const readTurso = kvReadSource() === "turso" && tursoEnabled;
+  const writeMode = kvWriteMode();
+  const read: KVBackendEx | null = readTurso
+    ? tursoKV
+    : dbEnabled
+      ? supabaseKV
+      : null;
+  if (!read) return { read: null, kv: mem };
+  const other: KVBackendEx | null =
+    read === tursoKV ? (dbEnabled ? supabaseKV : null)
+    : tursoEnabled ? tursoKV
+    : null;
+  let kv: KVBackend = read;
+  if (writeMode === "dual" && other) kv = dualKV(read, [other]);
+  else if (writeMode === "turso" && other && read !== tursoKV) kv = tursoKV;
+  else if (writeMode === "turso" && read === tursoKV) kv = tursoKV;
+  return { read, kv };
+}
+
+const { read: readBackend, kv: selectedKv } = buildBackends();
+const kv: KVBackend = selectedKv;
 export { kv };
-if (!dbEnabled) {
-  console.warn("[whopclip] SUPABASE_SERVICE_ROLE_KEY not set — using ephemeral in-memory store");
+/** Which backend serves reads right now (for health/debug endpoints). */
+export function kvBackendName(): string {
+  if (!readBackend) return "memory";
+  return readBackend === tursoKV ? "turso" : "supabase";
+}
+if (!dbEnabled && !tursoEnabled) {
+  console.warn("[whopclip] SUPABASE_SERVICE_ROLE_KEY and TURSO_AUTH_TOKEN not set — using ephemeral in-memory store");
 }
 
 /** Fetch a value plus its updated_at (for CAS). Exported so other modules
- *  can build atomic check-and-set operations on top of the same backend. */
+ *  can build atomic check-and-set operations on top of the same backend.
+ *  Reads from the configured read backend (supabase by default). */
 export async function getWithTs(key: string): Promise<{ value: unknown; updated_at: string } | null> {
-  if (!dbEnabled) return mem.getRow(key);
-  const full = `whopclip:${key}`;
-  const base = process.env.SUPABASE_URL ?? "https://lqvijxfbneqdrjzeeinn.supabase.co";
-  const k = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
-  const res = await fetch(
-    `${base}/rest/v1/flipify_kv?device_id=eq.whopclip&key=eq.${encodeURIComponent(full)}&select=value,updated_at`,
-    { headers: { apikey: k, Authorization: `Bearer ${k}` } }
-  );
-  if (!res.ok) return null;
-  const arr = (await res.json()) as Array<{ value: unknown; updated_at: string }>;
-  if (!arr.length) return null;
-  return { value: arr[0].value, updated_at: arr[0].updated_at };
+  if (!readBackend) return mem.getRow(key);
+  return readBackend.getWithTs(key);
 }
 
 /** Atomic compare-and-swap on updated_at: writes only if no other writer
  *  changed the row since getWithTs. Returns true iff this writer won.
  *  This is the primitive for all cross-pump mutual exclusion (upload
- *  locks, post-slot reservation). */
+ *  locks, post-slot reservation). In dual-write mode the win propagates
+ *  to the secondary backend. */
 export async function casKey(
   key: string,
   value: unknown,
   updatedAt: string
 ): Promise<boolean> {
-  return dbEnabled ? supabaseKV.cas(key, value, updatedAt) : mem.cas(key, value, updatedAt);
+  if (!readBackend) return mem.cas(key, value, updatedAt);
+  return kv.cas(key, value, updatedAt);
 }
 
 async function getIdx(key: string): Promise<string[]> {
@@ -330,9 +367,7 @@ export async function claimJob(device_id: string): Promise<Job | null> {
       status: "running",
       updated_at: new Date().toISOString(),
     };
-    const ok = dbEnabled
-      ? await supabaseKV.cas(`job:${id}`, claimed, row.updated_at)
-      : await mem.cas(`job:${id}`, claimed, row.updated_at);
+    const ok = await casKey(`job:${id}`, claimed, row.updated_at);
     if (ok) {
       await logActivity(device_id, "job_claimed", `Phone ne uthaya: ${claimed.type}`, claimed);
       return claimed;
