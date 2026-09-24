@@ -103,6 +103,7 @@ export interface Chain {
 const chainKey = (id: string) => `chain:${id}`;
 const chainIdxKey = (device_id: string, campaign_id: string) =>
   `chain_idx:${device_id}:${campaign_id}`;
+const deviceChainIdxKey = (device_id: string) => `chain_device_idx:${device_id}`;
 
 const MAX_STAGE_ATTEMPTS = 3;
 
@@ -118,6 +119,12 @@ async function saveChain(c: Chain): Promise<void> {
   if (!idx.includes(c.id)) {
     idx.push(c.id);
     await kv.set(chainIdxKey(c.device_id, c.campaign_id), idx);
+  }
+  // Device-level index for fast listActiveChains (avoids scanning 100+ campaigns).
+  const didx = await getIdx(deviceChainIdxKey(c.device_id));
+  if (!didx.includes(c.campaign_id)) {
+    didx.push(c.campaign_id);
+    await kv.set(deviceChainIdxKey(c.device_id), didx);
   }
 }
 
@@ -150,13 +157,21 @@ export async function activeChain(
 
 /** All active chains for a device (pump driver iterates these). */
 export async function listActiveChains(device_id: string): Promise<Chain[]> {
-  // Chains are indexed per campaign; walk the campaigns IN PARALLEL.
-  // Sequential reads USA->Mumbai (~250ms each) exceeded the Vercel deadline
-  // once the campaign store grew past ~100 campaigns (2026-09-23).
+  // Fast path: use the device-level index (campaigns with chains for this
+  // device). Falls back to full scan for legacy chains created before the
+  // index existed.
   const { listCampaigns } = await import("./store");
-  const campaigns = await listCampaigns();
+  let campaignIds: string[];
+  const didx = await getIdx(deviceChainIdxKey(device_id));
+  if (didx.length > 0) {
+    campaignIds = didx;
+  } else {
+    // Legacy fallback: scan all campaigns (slow, but only for old devices).
+    const campaigns = await listCampaigns();
+    campaignIds = campaigns.map((c) => c.id);
+  }
   const found = await Promise.all(
-    campaigns.map((camp) => activeChain(device_id, camp.id).catch(() => null))
+    campaignIds.map((cid) => activeChain(device_id, cid).catch(() => null))
   );
   return found.filter((c): c is Chain => !!c);
 }
@@ -439,9 +454,7 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
   // Gap G1 — budget exhaustion mid-chain: re-check the live budget right
   // before we spend a daily post slot. A campaign that hit $0 while the
   // chain was rendering must fail, not post.
-  // TEMPORARILY DISABLED (debugging advance timeout): the Content Rewards
-  // API call was hanging the endpoint. Re-enable after root cause found.
-  /*
+  // Timeout guard: 15s then park (don't fail the chain on a network hiccup).
   try {
     const live = await Promise.race([
       getApiDetail(chain.campaign_id),
@@ -472,7 +485,6 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
     await bumpAttempt(chain, `pre-post budget check failed: ${msg}`);
     return "failed";
   }
-  */
   // Gap G2 — caption builder verification: every required @mention/#hashtag
   // from the brief must be literally present in the caption before upload.
   {
