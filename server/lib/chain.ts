@@ -159,21 +159,30 @@ export async function activeChain(
 export async function listActiveChains(device_id: string): Promise<Chain[]> {
   // Fast path: use the device-level index (campaigns with chains for this
   // device). Falls back to full scan for legacy chains created before the
-  // index existed.
-  const { listCampaigns } = await import("./store");
-  let campaignIds: string[];
-  const didx = await getIdx(deviceChainIdxKey(device_id));
-  if (didx.length > 0) {
-    campaignIds = didx;
-  } else {
-    // Legacy fallback: scan all campaigns (slow, but only for old devices).
-    const campaigns = await listCampaigns();
-    campaignIds = campaigns.map((c) => c.id);
-  }
-  const found = await Promise.all(
-    campaignIds.map((cid) => activeChain(device_id, cid).catch(() => null))
+  // index existed. Wrapped in a timeout — if the scan hangs, return empty
+  // rather than blocking the phone's poll.
+  const fastPath = (async () => {
+    const { listCampaigns } = await import("./store");
+    let campaignIds: string[];
+    const didx = await getIdx(deviceChainIdxKey(device_id));
+    if (didx.length > 0) {
+      campaignIds = didx;
+    } else {
+      // Legacy fallback: scan all campaigns (slow, but only for old devices).
+      const campaigns = await listCampaigns();
+      campaignIds = campaigns.map((c) => c.id);
+    }
+    const found = await Promise.all(
+      campaignIds.map((cid) => activeChain(device_id, cid).catch(() => null))
+    );
+    return found.filter((c): c is Chain => !!c);
+  })();
+
+  const timeout = new Promise<Chain[]>((resolve) =>
+    setTimeout(() => resolve([]), 8000)
   );
-  return found.filter((c): c is Chain => !!c);
+
+  return Promise.race([fastPath, timeout]);
 }
 
 /** Read-only early check: posts published today (UTC) live in the slot ledger. */
@@ -749,6 +758,73 @@ export async function pumpDeviceChains(device_id: string): Promise<Chain[]> {
     }
   }
   return out;
+}
+
+/**
+ * Fast-path for /api/jobs/next: enqueue ig_post phone jobs for chains
+ * parked at the post stage. Does NOT do the full pump (no budget check,
+ * no campaign scan) — just the minimal work to get the phone its upload job.
+ * The full pump in /api/chains/advance handles the rest when it's responsive.
+ *
+ * Idempotent: skips chains that already have a phone job in flight or a post URL.
+ */
+export async function enqueuePendingPostJobs(device_id: string): Promise<number> {
+  let enqueued = 0;
+  try {
+    const chains = await listActiveChains(device_id);
+    const { getDevice, deviceOnline, enqueueJob, getJob } = await import("./store");
+    const { igPostJob } = await import("./jobs");
+
+    const device = await getDevice(device_id);
+    if (!device || !deviceOnline(device)) return 0; // phone offline, nothing to do
+
+    for (const chain of chains) {
+      try {
+        if (chain.status !== "active") continue;
+        if (chain.stage !== "post") continue;
+        if (chain.ig_post_url) continue;
+        if (!chain.video_url || !chain.caption) continue;
+
+        // Skip if a phone job is already in flight.
+        if (chain.phone_job_id) {
+          const pj = await getJob(chain.phone_job_id).catch(() => null);
+          if (pj && (pj.status === "queued" || pj.status === "running")) continue;
+        }
+
+        // Enqueue the ig_post job.
+        const now = new Date().toISOString();
+        const job = {
+          id: crypto.randomUUID(),
+          device_id,
+          type: "ig_post",
+          status: "queued" as const,
+          steps: igPostJob({ caption: chain.caption }),
+          payload: {
+            video_url: chain.video_url,
+            chain_id: chain.id,
+            campaign_id: chain.campaign_id,
+          },
+          campaign_id: chain.campaign_id,
+          result: null,
+          created_at: now,
+          updated_at: now,
+        };
+        await enqueueJob(job);
+
+        // Update chain with the job ID (direct KV write, avoid full saveChain).
+        const { kv } = await import("./store");
+        const updated = { ...chain, phone_job_id: job.id, updated_at: now,
+          error: `phone upload job queued (${job.id.slice(0, 8)}) — waiting for phone` };
+        await kv.set(`chain:${chain.id}`, updated);
+        enqueued++;
+      } catch {
+        /* one bad chain must not block the others */
+      }
+    }
+  } catch {
+    /* non-fatal */
+  }
+  return enqueued;
 }
 
 /* ------------------------------------------------------------------ */
