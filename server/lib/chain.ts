@@ -45,7 +45,7 @@ import {
 import { getPostSlots, MAX_POSTS_PER_DAY } from "./postslots";
 export { MAX_POSTS_PER_DAY };
 import { extractRequirementsFromText } from "./requirements";
-import { buildRenderSpec, enqueueRender, getRender } from "./render";
+import { buildRenderSpec, enqueueRenderDedup, getRender } from "./render";
 import {
   getCampaignDetail,
   probeJoinState,
@@ -437,8 +437,8 @@ async function runRenderStage(
     authorized_sources: parsed.authorized_sources ?? [],
     title_templates: parsed.title_templates ?? [],
   });
-  await enqueueRender(spec);
-  chain.render_id = spec.id;
+  const { spec: renderSpec } = await enqueueRenderDedup(spec);
+  chain.render_id = renderSpec.id;
   resetAttempts(chain);
   await saveChain(chain);
   return "parked"; // /api/render/result resumes the chain

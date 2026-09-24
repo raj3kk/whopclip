@@ -36,6 +36,12 @@ export interface RenderSpec {
   hook_text: string;
   /** exact caption to burn into the post step */
   caption: string;
+  /**
+   * Dedup key: sha256 hex of "campaign_id|authorized_source|hook_text|caption"
+   * (all trimmed). Set by buildRenderSpec / enqueueRenderDedup before storing.
+   * Optional: specs persisted before the dedup rollout don't carry it.
+   */
+  variant_key?: string;
   status: "queued" | "claimed" | "done" | "failed";
   /** worker-side attempts (transient infra failures requeue, capped) */
   worker_attempts: number;
@@ -60,6 +66,43 @@ async function addToIdx(key: string, id: string) {
     idx.push(id);
     await kv.set(key, idx);
   }
+}
+
+/**
+ * Variant dedup key: sha256 hex of
+ * "campaign_id|authorized_source|hook_text|caption" (all trimmed).
+ * The same logical render (same campaign, source, hook, caption) always
+ * hashes to the same key regardless of its random render id.
+ */
+export function variantKeyFor(parts: {
+  campaign_id: string;
+  authorized_source: string;
+  hook_text: string;
+  caption: string;
+}): string {
+  const s = [
+    parts.campaign_id,
+    parts.authorized_source,
+    parts.hook_text,
+    parts.caption,
+  ]
+    .map((x) => String(x ?? "").trim())
+    .join("|");
+  return crypto.createHash("sha256").update(s, "utf8").digest("hex");
+}
+
+/** Dedup index: variant_key -> render_id (the latest render for that key). */
+const VARIANT_IDX = "render_variant_idx";
+
+async function getVariantIdx(): Promise<Record<string, string>> {
+  const v = (await kv.get(VARIANT_IDX)) as unknown;
+  return v && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, string>)
+    : {};
+}
+
+async function setVariantIdx(idx: Record<string, string>): Promise<void> {
+  await kv.set(VARIANT_IDX, idx);
 }
 
 /**
@@ -99,6 +142,12 @@ export function buildRenderSpec(
     title_templates: opts.title_templates,
     hook_text: hook,
     caption,
+    variant_key: variantKeyFor({
+      campaign_id: campaign.id,
+      authorized_source: source,
+      hook_text: hook,
+      caption,
+    }),
     status: "queued",
     worker_attempts: 0,
     video_url: null,
@@ -109,11 +158,52 @@ export function buildRenderSpec(
   };
 }
 
-export async function enqueueRender(spec: RenderSpec): Promise<RenderSpec> {
+/**
+ * Enqueue a render spec with server-side variant deduplication.
+ *
+ * If a render with the same variant_key already exists with status
+ * done/claimed/queued, the EXISTING spec is returned with duplicate=true
+ * and nothing is enqueued. A `failed` existing render allows re-enqueue:
+ * the index is overwritten with the new id and the new spec is enqueued
+ * normally (duplicate=false).
+ */
+export async function enqueueRenderDedup(
+  spec: RenderSpec
+): Promise<{ spec: RenderSpec; duplicate: boolean }> {
+  if (!spec.variant_key) {
+    spec.variant_key = variantKeyFor({
+      campaign_id: spec.campaign_id,
+      authorized_source: spec.authorized_source,
+      hook_text: spec.hook_text,
+      caption: spec.caption,
+    });
+  }
+  const idx = await getVariantIdx();
+  const existingId = idx[spec.variant_key];
+  if (existingId) {
+    const existing = await getRender(existingId);
+    if (
+      existing &&
+      (existing.status === "done" ||
+        existing.status === "claimed" ||
+        existing.status === "queued")
+    ) {
+      // Same logical render already in flight or finished — never render twice.
+      return { spec: existing, duplicate: true };
+    }
+    // existing is failed or the row vanished: fall through and re-enqueue.
+  }
+  idx[spec.variant_key] = spec.id;
+  await setVariantIdx(idx);
   await kv.set(renderKey(spec.id), spec);
   await addToIdx("render_queue", spec.id);
   await addToIdx(`render_queue:${spec.device_id}`, spec.id);
-  return spec;
+  return { spec, duplicate: false };
+}
+
+export async function enqueueRender(spec: RenderSpec): Promise<RenderSpec> {
+  const { spec: s } = await enqueueRenderDedup(spec);
+  return s;
 }
 
 export async function getRender(id: string): Promise<RenderSpec | null> {
@@ -184,4 +274,24 @@ export async function listRenders(device_id?: string): Promise<RenderSpec[]> {
     if (s) out.push(s);
   }
   return out.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+}
+
+/**
+ * Round-robin reuse: returns the newest `done` render for the campaign that
+ * has a video_url (any device), or null when there is none. Lets chains
+ * reuse an already-rendered video instead of queueing a fresh render.
+ */
+export async function getReusableRender(
+  campaign_id: string,
+  _device_id?: string
+): Promise<RenderSpec | null> {
+  const ids = await getIdx("render_queue");
+  let best: RenderSpec | null = null;
+  for (const id of ids) {
+    const s = await getRender(id);
+    if (!s || s.campaign_id !== campaign_id) continue;
+    if (s.status !== "done" || !s.video_url) continue;
+    if (!best || s.created_at > best.created_at) best = s;
+  }
+  return best;
 }

@@ -18,7 +18,7 @@ import {
   type Submission,
 } from "./store";
 import { extractRequirementsFromText } from "./requirements";
-import { buildRenderSpec, enqueueRender, getRender } from "./render";
+import { buildRenderSpec, enqueueRenderDedup, getRender } from "./render";
 import { startChain, type Chain } from "./chain";
 import {
   discoverCampaigns,
@@ -319,11 +319,15 @@ export async function enqueueRunStep(
         authorized_sources: extraction.authorized_sources,
         title_templates: extraction.title_templates,
       });
-      await enqueueRender(spec);
+      const { spec: renderSpec, duplicate } = await enqueueRenderDedup(spec);
       // Return a marker job so the dashboard can track render state.
       // render_clip jobs are server-side; mark done immediately — the VM
       // worker picks up the spec via /api/render/next.
-      const renderResult = { render_id: spec.id, status: "queued" };
+      const renderResult = {
+        render_id: renderSpec.id,
+        status: duplicate ? renderSpec.status : "queued",
+        duplicate,
+      };
       return {
         job: serverMarker("render_clip", device_id, campaign.id, renderResult, now),
         campaign,
