@@ -439,8 +439,9 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
   // Gap G1 — budget exhaustion mid-chain: re-check the live budget right
   // before we spend a daily post slot. A campaign that hit $0 while the
   // chain was rendering must fail, not post.
-  // Timeout guard: the Content Rewards API can hang; 15s timeout then park
-  // (don't fail the chain on a network hiccup).
+  // TEMPORARILY DISABLED (debugging advance timeout): the Content Rewards
+  // API call was hanging the endpoint. Re-enable after root cause found.
+  /*
   try {
     const live = await Promise.race([
       getApiDetail(chain.campaign_id),
@@ -471,6 +472,7 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
     await bumpAttempt(chain, `pre-post budget check failed: ${msg}`);
     return "failed";
   }
+  */
   // Gap G2 — caption builder verification: every required @mention/#hashtag
   // from the brief must be literally present in the caption before upload.
   {
