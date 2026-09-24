@@ -33,6 +33,7 @@ export async function POST(
     return NextResponse.json({ error: "device_id required" }, { status: 400 });
   }
 
+  try {
   const chain = await getChain(chainId);
   if (!chain) {
     return NextResponse.json({ error: "chain not found" }, { status: 404 });
@@ -122,4 +123,13 @@ export async function POST(
     status: "queued",
     note: "ig_post job enqueued, phone will claim on next poll",
   });
+  } catch (e) {
+    // KV/Supabase stall — return a clean 500 so callers (and the phone)
+    // fail fast and retry, instead of hanging into FUNCTION_INVOCATION_TIMEOUT.
+    const msg = e instanceof Error ? e.message : String(e);
+    return NextResponse.json(
+      { error: `storage unavailable: ${msg}` },
+      { status: 500 }
+    );
+  }
 }

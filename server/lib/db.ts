@@ -47,8 +47,11 @@ async function sb(
     cache: "no-store",
     // Fail fast: a stalled Supabase REST call must never hang a route
     // indefinitely (2026-09-24: /api/render/next hung 1h+ on a stalled KV
-    // read while worker ticks piled up). 30s is generous for KV ops.
-    signal: AbortSignal.timeout(30_000),
+    // read while worker ticks piled up; Supabase partial degradation made
+    // flipify_kv queries hang). 12s is generous for KV ops (<1s normal) and
+    // well under Vercel maxDuration=30, so routes return a clean 500 JSON
+    // instead of FUNCTION_INVOCATION_TIMEOUT.
+    signal: AbortSignal.timeout(12_000),
     headers: {
       apikey: SB_KEY,
       Authorization: `Bearer ${SB_KEY}`,
