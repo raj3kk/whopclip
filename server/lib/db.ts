@@ -45,6 +45,10 @@ async function sb(
     // the phone's status screen and the automation loop depend on fresh DB
     // values every request (2026-09-23: frozen status for hours).
     cache: "no-store",
+    // Fail fast: a stalled Supabase REST call must never hang a route
+    // indefinitely (2026-09-24: /api/render/next hung 1h+ on a stalled KV
+    // read while worker ticks piled up). 30s is generous for KV ops.
+    signal: AbortSignal.timeout(30_000),
     headers: {
       apikey: SB_KEY,
       Authorization: `Bearer ${SB_KEY}`,
