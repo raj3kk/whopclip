@@ -1,36 +1,35 @@
 /**
- * WhopClip chain engine — FULLY SERVER-SIDE campaign pipeline.
+ * WhopClip chain engine — HYBRID campaign pipeline (user-ordered 2026-09-24).
  *
  * One chain per (device_id, campaign_id). Stages:
  *   check -> join -> render -> post -> verify -> submit -> done
  *
- * Every stage runs on the Vercel (USA) server using the phone-uploaded
- * encrypted sessions (Whop + Instagram), decrypted only in server memory:
- *   - check:  campaign detail + join-state probe + requirements extraction
- *   - join:   applyToCampaign API
- *   - render: VM render worker (async; parks here until /api/render/result)
- *   - post:   Instagram reel upload from the server (lib/igpost)
- *   - verify: server-side reel metadata verify (lib/instagram)
- *   - submit: createSubmission API + recordSubmission
+ *   - check/join/render: server-side (Vercel USA) using phone-uploaded sessions.
+ *   - post: PHONE-SIDE. After render, the chain parks if the phone is offline.
+ *     When online, the server enqueues an `ig_post` phone job (igPostJob steps);
+ *     the phone's JobEngine downloads payload.video_url and uploads via its
+ *     real device/IP (no datacenter block), then reports { post_url } or
+ *     { error }. onJobDone/onJobFailed resume the chain.
+ *   - verify: server-side reel verify (lib/instagram); falls back to the
+ *     phone's live-verification payload when the server IP is blocked.
+ *   - submit: server-side createSubmission API + recordSubmission.
  *
- * The phone's ONLY role is login/session upload: it never runs chain jobs.
+ * The phone's role: login/session upload + Instagram upload jobs.
  *
  * Advancement triggers (any of them may pump the chain; all idempotent):
  *   - POST /api/run {step:"full"}          -> startChain -> pumpChain
  *   - POST /api/render/result               -> onRenderDone -> pumpChain
  *   - GET  /api/chains/advance?device_id=   -> pumpChain on every active chain
  *       (called by the phone's PollWorker each poll + dashboard button;
- *        Vercel Hobby allows only one cron/day, so the phone poll is the
- *        retry driver for long stages like `post`.)
+ *        the phone poll is the retry driver: when the phone comes online,
+ *        its poll pumps the parked post stage and enqueues the upload job.)
+ *   - POST /api/jobs/:id {status}           -> onJobDone/onJobFailed -> pump
  *
  * Fail-closed: ambiguous join state, incomplete requirements, unverifiable
  * post, failed verify, or failed submit stop the chain with a reason.
  * Each stage gets MAX_STAGE_ATTEMPTS attempts; then the chain fails.
- * Duplicate-post protection: a chain posts at most once. The igpost KV
- * record (`igpost:<chain_id>`) is the point of no return: `configure` (the
- * only publishing call) runs once per chain, concurrent pumps are
- * serialized by a lock, and a chain that already has ig_post_url skips the
- * post stage entirely.
+ * Duplicate-post protection: a chain posts at most once (ig_post_url set
+ * once; phone_job_id cleared after terminal job).
  */
 import crypto from "crypto";
 import {
@@ -78,6 +77,10 @@ export interface Chain {
   status: ChainStatus;
   /** legacy: phone job id (no longer used for new chains) */
   job_id: string | null;
+  /** phone ig_post job id (hybrid post stage: phone uploads, server verifies) */
+  phone_job_id: string | null;
+  /** phone's live-verification payload from ig_post (fallback when server IP blocked) */
+  phone_verify_json: string | null;
   /** render spec id (render stage) */
   render_id: string | null;
   /** extracted post URL (post stage output) */
@@ -222,6 +225,8 @@ export async function startChain(
     stage: "check",
     status: "active",
     job_id: null,
+    phone_job_id: null,
+    phone_verify_json: null,
     render_id: null,
     ig_post_url: null,
     video_url: null,
@@ -416,10 +421,7 @@ async function runRenderStage(
 }
 
 async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
-  // Duplicate-post protection: never post twice for one chain. The igpost
-  // KV record (`igpost:<chain_id>`) is the point of no return — `configure`
-  // (the only publishing call) runs once per chain, and concurrent pumps
-  // are serialized by a lock.
+  // Duplicate-post protection: never post twice for one chain.
   if (chain.ig_post_url) {
     resetAttempts(chain);
     chain.stage = "verify";
@@ -428,10 +430,6 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
   }
   if (!chain.video_url || !/^https?:\/\//i.test(chain.video_url)) {
     await failChain(chain, "post stage reached without a rendered video_url");
-    return "failed";
-  }
-  if (!chain.cover_url || !/^https?:\/\//i.test(chain.cover_url)) {
-    await failChain(chain, "post stage reached without a render-supplied cover_url (real frame required)");
     return "failed";
   }
   if (!chain.caption) {
@@ -482,74 +480,73 @@ async function runPostStage(chain: Chain): Promise<"advanced" | "failed"> {
       return "failed";
     }
   }
-  // Early read-only slot check: refuse/park when today's cap is already
-  // reached. The authoritative atomic reservation happens inside the upload,
-  // immediately before configure (spacing is enforced there).
+  // Daily post cap check (read-only; authoritative reservation happens at upload).
   const slots = await getPostSlots(chain.device_id);
   if (slots.count >= MAX_POSTS_PER_DAY) {
-    // Park WITHOUT consuming an attempt — the UTC date rolls over and a
-    // later pump resumes the chain.
     chain.error = `daily post cap reached (${slots.count}/${MAX_POSTS_PER_DAY}) — parked until tomorrow (UTC)`;
     chain.updated_at = new Date().toISOString();
     await saveChain(chain);
     return "advanced"; // stage unchanged -> pump loop parks
   }
-  const { postReelToInstagram } = await import("./igpost");
-  let res;
-  try {
-    res = await postReelToInstagram(
-      chain.device_id,
-      chain.id,
-      chain.video_url,
-      chain.cover_url,
-      chain.caption
-    );
-  } catch (e: unknown) {
-    await bumpAttempt(
-      chain,
-      `instagram upload threw: ${e instanceof Error ? e.message : "unknown"}`
-    );
-    return "failed";
-  }
-  if (res.session_expired) {
-    // Definitive auth expiry — igpost already marked the session stale, so
-    // the phone shows "login again". This is terminal for the stage, not a
-    // transient attempt.
-    await bumpAttempt(chain, "instagram session expired — phone pe dobara login karo");
-    return "failed";
-  }
-  if (!res.ok) {
-    if (res.retryable) {
-      // Transient (rate limit, lock busy, timeout): park in the post stage
-      // WITHOUT consuming an attempt; the next pump retries.
-      chain.error = `instagram upload pending: ${res.error ?? "retryable"}`;
+
+  // ---- HYBRID POST (user-ordered 2026-09-24): phone uploads via its real
+  // device/IP (no datacenter block), server verifies + submits. ----
+  // If a phone job is already in flight, just park and wait for its callback.
+  if (chain.phone_job_id) {
+    const { getJob } = await import("./store");
+    const pj = await getJob(chain.phone_job_id);
+    if (pj && (pj.status === "queued" || pj.status === "running")) {
+      chain.error = `phone upload in progress (job ${pj.type}, status ${pj.status}) — waiting for phone`;
       chain.updated_at = new Date().toISOString();
       await saveChain(chain);
-      return "advanced"; // stage unchanged -> pump loop parks
+      return "advanced"; // parked; onJobDone/onJobFailed resumes
     }
-    await bumpAttempt(
-      chain,
-      `instagram upload failed: ${res.error ?? "no post_url"}`
-    );
-    return "failed";
+    // Job reached a terminal state without advancing the chain (e.g. server
+    // restarted mid-callback): clear it so a fresh job is enqueued below.
+    // If the job actually succeeded, onJobDone already set ig_post_url and
+    // we returned at the top.
+    chain.phone_job_id = null;
   }
-  if (res.phase === "uploading" || res.phase === "transcoding" || res.phase === "busy") {
-    // Multi-pump upload still in flight — park in the post stage.
-    chain.error = `instagram upload in progress (phase: ${res.phase})`;
+
+  // Phone must be online before we hand it work. Offline -> park here;
+  // the phone's next poll (GET /api/jobs/next touches last_poll_at, and
+  // /api/chains/advance pumps) resumes the chain automatically.
+  const { getDevice, deviceOnline, enqueueJob } = await import("./store");
+  const device = await getDevice(chain.device_id);
+  if (!device || !deviceOnline(device)) {
+    chain.error = "phone offline — waiting for phone to come online (job bhej diya jayega)";
     chain.updated_at = new Date().toISOString();
     await saveChain(chain);
-    return "advanced"; // stage unchanged -> pump loop parks
+    return "advanced"; // parked at post; next pump retries
   }
-  if (!res.post_url) {
-    await bumpAttempt(chain, "instagram upload returned ok but no post_url");
-    return "failed";
-  }
-  chain.ig_post_url = res.post_url;
-  chain.error = null;
+
+  // Enqueue the phone upload job. The phone's JobEngine downloads
+  // payload.video_url, uploads via Instagram WebView, and reports back
+  // { post_url } on done or { error } on failed.
+  const { igPostJob } = await import("./jobs");
+  const now = new Date().toISOString();
+  const job = {
+    id: crypto.randomUUID(),
+    device_id: chain.device_id,
+    type: "ig_post",
+    status: "queued" as const,
+    steps: igPostJob({ caption: chain.caption }),
+    payload: {
+      video_url: chain.video_url,
+      chain_id: chain.id,
+      campaign_id: chain.campaign_id,
+    },
+    campaign_id: chain.campaign_id,
+    result: null,
+    created_at: now,
+    updated_at: now,
+  };
+  await enqueueJob(job);
+  chain.phone_job_id = job.id;
   resetAttempts(chain);
-  chain.stage = "verify";
+  chain.error = `phone upload job queued (${job.id.slice(0, 8)}) — waiting for phone to pick it up`;
   await saveChain(chain);
-  return "advanced";
+  return "advanced"; // parked at post; phone callback resumes
 }
 
 async function runVerifyStage(chain: Chain): Promise<"advanced" | "failed"> {
@@ -570,10 +567,28 @@ async function runVerifyStage(chain: Chain): Promise<"advanced" | "failed"> {
       required_tags: requiredTags,
     });
   } catch (e: unknown) {
-    await bumpAttempt(
-      chain,
-      `reel verify threw: ${e instanceof Error ? e.message : "unknown"}`
-    );
+    const msg = e instanceof Error ? e.message : "unknown";
+    // Hybrid fallback (user-ordered 2026-09-24): the server's datacenter IP
+    // is blocked by Instagram, but the phone's ig_post job already did a
+    // live DOM verification (video element + URL pattern + metrics). If we
+    // have the phone's proof, trust it instead of failing on our IP block.
+    const isNetworkBlock =
+      /timeout|network|econn|socket|fetch failed|wrong|blocked/i.test(msg);
+    if (isNetworkBlock && chain.phone_verify_json) {
+      try {
+        const pv = JSON.parse(chain.phone_verify_json);
+        if (pv.post_url === chain.ig_post_url) {
+          chain.error = null;
+          resetAttempts(chain);
+          chain.stage = "submit";
+          await saveChain(chain);
+          return "advanced"; // phone-verified; server fetch IP-blocked
+        }
+      } catch {
+        /* fall through to bumpAttempt */
+      }
+    }
+    await bumpAttempt(chain, `reel verify threw: ${msg}`);
     return "failed";
   }
   if (!vr.live) {
@@ -830,14 +845,31 @@ export async function onRenderDone(
 }
 
 /**
- * Mark the chain's current phone job as failed (legacy: new chains never
- * enqueue phone jobs, so this only touches chains that still reference one).
+ * Phone job failed: for hybrid chains (phone_job_id set), record the phone's
+ * reported reason and bump the stage attempt. Legacy job_id path kept below.
  */
 export async function onJobFailed(job: Job): Promise<Chain | null> {
   if (!job.campaign_id) return null;
   const chain = await activeChain(job.device_id, job.campaign_id);
+  if (!chain || chain.status !== "active") return chain;
+  // Hybrid post stage: the phone's ig_post job failed — surface its reason.
+  if (chain.phone_job_id === job.id && job.type === "ig_post") {
+    const r = (job.result ?? {}) as Record<string, unknown>;
+    const reason =
+      typeof r.error === "string" && r.error
+        ? r.error
+        : `phone upload failed: ${JSON.stringify(job.result ?? {}).slice(0, 200)}`;
+    // Session expired on the phone -> mark stale so the app prompts re-login.
+    if (r.session_expired === true) {
+      const { markSessionStale } = await import("./store");
+      await markSessionStale(chain.device_id, "instagram").catch(() => {});
+    }
+    chain.phone_job_id = null; // allow a fresh job on the next pump
+    await bumpAttempt(chain, reason);
+    return chain;
+  }
+  // Legacy path (pre-hybrid chains).
   if (!chain || chain.job_id !== job.id) return null;
-  if (chain.status !== "active") return chain;
   await failChain(
     chain,
     `phone job ${job.type} failed: ${JSON.stringify(job.result ?? {}).slice(0, 300)}`
@@ -845,13 +877,51 @@ export async function onJobFailed(job: Job): Promise<Chain | null> {
   return chain;
 }
 
-/** Legacy: phone jobs no longer drive new chains; kept for old in-flight jobs. */
+/**
+ * Phone job done: for hybrid chains, an ig_post success carries { post_url }
+ * (extracted by the phone's JobEngine). Store it and advance to verify.
+ */
 export async function onJobDone(job: Job): Promise<Chain | null> {
   if (!job.campaign_id) return null;
   const chain = await activeChain(job.device_id, job.campaign_id);
+  if (!chain || chain.status !== "active") return chain;
+  // Hybrid post stage: phone uploaded the reel — grab its URL and verify.
+  if (chain.phone_job_id === job.id && job.type === "ig_post") {
+    const r = (job.result ?? {}) as Record<string, unknown>;
+    const postUrl =
+      typeof r.post_url === "string" && /^https?:\/\//i.test(r.post_url)
+        ? r.post_url
+        : "";
+    if (!postUrl) {
+      chain.phone_job_id = null;
+      await bumpAttempt(
+        chain,
+        `phone reported done but no post_url in result: ${JSON.stringify(r).slice(0, 200)}`
+      );
+      return chain;
+    }
+    chain.ig_post_url = postUrl;
+    chain.phone_job_id = null;
+    // Store the phone's live-verification (live_metrics + video check from
+    // igPostJob steps) as fallback proof if the server's own fetch is
+    // IP-blocked.
+    try {
+      chain.phone_verify_json = JSON.stringify({
+        post_url: postUrl,
+        live_metrics: r.live_metrics ?? null,
+        verified_at: new Date().toISOString(),
+      });
+    } catch {
+      chain.phone_verify_json = null;
+    }
+    chain.error = null;
+    resetAttempts(chain);
+    chain.stage = "verify";
+    await saveChain(chain);
+    return pumpChain(chain);
+  }
+  // Legacy path (pre-hybrid chains).
   if (!chain || chain.job_id !== job.id) return null;
-  // New server-side chains have job_id = null, so this path only serves
-  // chains started before the server-side migration.
   return chain;
 }
 

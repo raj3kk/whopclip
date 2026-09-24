@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pumpDeviceChains } from "@/lib/chain";
+import { touchDevice } from "@/lib/store";
 
 /**
  * GET /api/chains/advance?device_id=...
@@ -27,6 +28,10 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "device_id required" }, { status: 400 });
   }
   try {
+    // The phone is clearly online (it's calling us) — touch last_poll_at
+    // BEFORE pumping so the hybrid post stage sees it as online and
+    // enqueues the ig_post job in this same pass (no 15-min delay).
+    await touchDevice(device_id).catch(() => {});
     const chains = await pumpDeviceChains(device_id);
     return NextResponse.json({
       ok: true,

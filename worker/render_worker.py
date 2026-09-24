@@ -33,10 +33,12 @@ Usage:
       # no server calls: render locally, print local paths
 """
 import argparse
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -76,22 +78,38 @@ def run(cmd, timeout=600):
 
 
 def api(method, path, body=None):
+    # urllib through the egress proxy intermittently drops connections
+    # (RemoteDisconnected/IncompleteRead) while curl to the same endpoint
+    # succeeds — so retry idempotent GET polls on connection-level errors.
+    # HTTPError = server decision, never retried. POSTs are not retried
+    # (a dropped POST may already have been received server-side).
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        BASE + path, data=data, method=method,
-        headers={"x-cron-secret": SECRET, "Content-Type": "application/json",
-                 "User-Agent": "whopclip-render-worker"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            if r.status == 204:
+    attempts = 3 if method == "GET" else 1
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(
+            BASE + path, data=data, method=method,
+            headers={"x-cron-secret": SECRET, "Content-Type": "application/json",
+                     "User-Agent": "whopclip-render-worker"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if r.status == 204:
+                    return None
+                raw = r.read()
+                return json.loads(raw.decode()) if raw else None
+        except urllib.error.HTTPError as e:
+            if e.code == 204:
                 return None
-            raw = r.read()
-            return json.loads(raw.decode()) if raw else None
-    except urllib.error.HTTPError as e:
-        if e.code == 204:
-            return None
-        raise
+            raise
+        except (urllib.error.URLError, http.client.RemoteDisconnected,
+                http.client.IncompleteRead, ConnectionError, TimeoutError,
+                socket.timeout) as e:
+            last_err = e
+            if attempt < attempts:
+                log(f"api {method} {path}: {type(e).__name__} (attempt {attempt}/{attempts}), retrying")
+                time.sleep(5 * attempt)
+    raise last_err
 
 
 def download_source(url, out_path, max_bytes=600 * 1024 * 1024):
