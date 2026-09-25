@@ -7,9 +7,12 @@ import { getDevice } from "@/lib/store";
  * Optional: job_type, current_step (used when key is "live").
  *
  * Special key "live": the phone uploads a downscaled JPEG WebView screenshot
- * after every job step. The object is upserted (stable URL per job) and a
- * live pointer is saved so GET /api/live can show the phone's current
- * screen on the dashboard.
+ * after every job step. The object is upserted at a STABLE per-device path
+ * (frames/<device_id>/live.jpg) — every upload instantly replaces the
+ * previous screenshot, so live frames never accumulate storage. A live
+ * pointer is saved so GET /api/live can show the phone's current screen
+ * on the dashboard. Pointers older than 10 min are lazily expired
+ * (storage object + pointer deleted) on the next /api/live read.
  *
  * The phone's JobEngine captures WebView screenshots during verify stages
  * and uploads them here. The route:
@@ -100,11 +103,15 @@ export async function POST(req: NextRequest) {
   }
 
   // Live frames (key "live") are downscaled JPEGs the phone uploads after
-  // every job step; verify frames stay PNG. x-upsert overwrites the object
-  // so the live URL is stable per job.
+  // every job step; verify frames stay PNG. x-upsert overwrites the object.
+  // Live frames use a STABLE per-device path — each upload instantly
+  // replaces the previous screenshot (purana frame turant delete, storage
+  // kabhi badhta nahi). GET /api/live expires pointers older than 10 min.
   const isLive = key === "live";
   const ext = isLive ? "jpg" : "png";
-  const objectPath = `frames/${safeSegment(device_id)}/${safeSegment(job_id)}/${safeSegment(key)}.${ext}`;
+  const objectPath = isLive
+    ? `frames/${safeSegment(device_id)}/live.jpg`
+    : `frames/${safeSegment(device_id)}/${safeSegment(job_id)}/${safeSegment(key)}.${ext}`;
   const bytes = Buffer.from(await file.arrayBuffer());
   const upload = await fetch(
     `${SB_URL}/storage/v1/object/${BUCKET}/${objectPath}`,

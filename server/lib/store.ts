@@ -433,6 +433,13 @@ export async function finishJob(
   job.result = result;
   job.updated_at = new Date().toISOString();
   await kv.set(`job:${id}`, job);
+  // Job khatam — uska live screenshot bhi turant hata do (10-min expiry
+  // ka wait nahi). Best-effort: kabhi finish ko fail nahi karta.
+  try {
+    await clearLiveFrame(job.device_id);
+  } catch {
+    /* live frame cleanup is best-effort */
+  }
   const kind =
     status === "done" ? "job_done" : status === "failed" ? "job_failed" : "job_cancelled";
   const msg =
@@ -911,4 +918,18 @@ export async function setLiveFrame(
 
 export async function getLiveFrame(device_id: string): Promise<LiveFrame | null> {
   return (await kv.get(`liveframe:${device_id}`)) as LiveFrame | null;
+}
+
+/**
+ * Live frames expire after 10 min (user rule: screenshots must not
+ * accumulate storage). GET /api/live lazily expires them — the dashboard
+ * polls it every 5s, so expiry + storage-object deletion happens on the
+ * next read after the TTL. Deletion convention here is kv.set(key, null).
+ */
+export const LIVE_FRAME_TTL_MS = 10 * 60 * 1000;
+
+export async function clearLiveFrame(device_id: string): Promise<LiveFrame | null> {
+  const cur = await getLiveFrame(device_id);
+  await kv.set(`liveframe:${device_id}`, null);
+  return cur;
 }
