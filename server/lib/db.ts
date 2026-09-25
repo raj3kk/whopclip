@@ -35,7 +35,7 @@ export function nextVersion(): string {
 }
 
 async function sb(
-  method: "GET" | "POST" | "PATCH",
+  method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
   body?: unknown
 ): Promise<{ status: number; json: unknown }> {
@@ -161,6 +161,12 @@ export const supabaseKV: KVBackendEx = {
     const full = `whopclip:${key}`;
     const now = nextVersion();
     const filter = `device_id=eq.${DEVICE}&key=eq.${encodeURIComponent(full)}`;
+    if (value === null || value === undefined) {
+      // Clear semantics: null/undefined deletes the row (no tombstones).
+      // Both backends agree — keeps dual-write reconcile clean.
+      await sb("DELETE", `/rest/v1/flipify_kv?${filter}`);
+      return;
+    }
     // NOTE (2026-09-22): PostgREST upsert (?on_conflict=device_id,key) 409s
     // on this project's flipify_kv because there is no UNIQUE(device_id,key)
     // constraint. So: PATCH-then-POST. PATCH updates the existing row when

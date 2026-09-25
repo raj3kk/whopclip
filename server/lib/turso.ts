@@ -163,6 +163,12 @@ export const tursoKV: KVBackendEx = {
 
   async set(key: string, value: unknown) {
     const full = `whopclip:${key}`;
+    if (value === null || value === undefined) {
+      // Clear semantics: null/undefined deletes the row (no tombstones).
+      // Both backends agree — keeps dual-write reconcile clean.
+      await pipeline([{ sql: "DELETE FROM kv WHERE key = ?", args: [full] }]);
+      return;
+    }
     await pipeline([{ sql: UPSERT, args: [full, ser(value), nextVersion()] }]);
   },
 
