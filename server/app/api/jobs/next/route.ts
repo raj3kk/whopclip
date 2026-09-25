@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { claimJob, touchDevice } from "@/lib/store";
+import { claimJob, requeueStuckJobs, touchDevice } from "@/lib/store";
 
 /**
  * GET /api/jobs/next?device_id=...
@@ -21,6 +21,16 @@ export async function GET(req: NextRequest) {
     app_version: req.nextUrl.searchParams.get("app_version") ?? undefined,
     device_model: req.nextUrl.searchParams.get("device_model") ?? undefined,
   }).catch(() => {});
+
+  // Stuck-job recovery on EVERY poll (fix 2026-09-25): a "running" job whose
+  // heartbeat died >10 min ago is requeued here, so a dead phone/worker
+  // never blocks the pipeline for 22h waiting for the daily tick. This runs
+  // before claimJob so the same poll picks up the recovered job fresh.
+  try {
+    await requeueStuckJobs(device_id);
+  } catch {
+    /* non-fatal: claim path still works */
+  }
 
   // Hybrid: enqueue pending post-stage phone jobs (fast path, no full pump).
   // This runs before claimJob so the phone picks up the upload on this poll.
