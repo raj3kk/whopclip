@@ -11,6 +11,7 @@
  *   campaigns                       string[] (index of campaign ids)
  *   job:{id}                        Job
  *   queue:{device_id}               string[] (job ids, enqueue order)
+ *   device_token:{device_id}        { fcm_token, updated_at } (FCM wake push)
  *   submission:{id}                 Submission
  *   submissions:{device_id}         string[] (submission ids)
  */
@@ -26,6 +27,7 @@ import {
   type KVBackendEx,
 } from "./db";
 import { tursoKV, tursoEnabled, tursoGetWithTs } from "./turso";
+import { sendPush } from "./fcm";
 import crypto from "crypto";
 
 export type ServiceName = "whop" | "instagram";
@@ -344,6 +346,38 @@ export async function enqueueJob(job: Job): Promise<void> {
   await kv.set(`job:${job.id}`, job);
   await addToIdx(`queue:${job.device_id}`, job.id);
   await logActivity(job.device_id, "job_enqueued", `Enqueued: ${job.type}`, job);
+  // FCM wake (best-effort, enqueue path kabhi block nahi hota): device
+  // offline dikh raha ho aur uska FCM token registered ho to ek wake push
+  // bhejo taaki phone turant poll kare. Floating promise — fail-soft.
+  void wakeDeviceIfOffline(job.device_id, {
+    type: "wake",
+    job_id: job.id,
+    job_type: job.type,
+  }).catch(() => {});
+}
+
+/**
+ * Device offline dikh raha ho to ek best-effort FCM wake push bhejo.
+ * Kabhi throw nahi karta — enqueue/cron paths is par depend nahi karte.
+ */
+export async function wakeDeviceIfOffline(
+  device_id: string,
+  data?: Record<string, string>
+): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const d = await getDevice(device_id);
+    if (!d || deviceOnline(d)) return { ok: false, reason: "online_or_unknown" };
+    const token = await getDeviceFcmToken(device_id);
+    if (!token) return { ok: false, reason: "no_token" };
+    const r = await sendPush(token, {
+      title: "WhopClip",
+      body: "Naya kaam aaya hai — app kholo aur sync karo.",
+      data,
+    });
+    return r.ok ? { ok: true } : { ok: false, reason: r.reason };
+  } catch {
+    return { ok: false, reason: "fcm_error" };
+  }
 }
 
 export async function getJob(id: string): Promise<Job | null> {
@@ -695,6 +729,42 @@ export async function disconnectDevice(device_id: string): Promise<void> {
   await kv.set(`device:${device_id}`, null);
   const ids = await getIdx("devices");
   await kv.set("idx:devices", ids.filter((id) => id !== device_id));
+}
+
+/* ---------------- device FCM tokens ----------------
+ * Key: `device_token:${device_id}` (db.ts layer `whopclip:` prefix lagata
+ * hai, dual-write/Turso yahan se automatic). Phone apna FCM registration
+ * token /api/devices/token se register karta hai; server wake push ke liye
+ * yahan se padhta hai. Token change ho to upsert se overwrite ho jata hai.
+ */
+
+const deviceTokenKey = (device_id: string) => `device_token:${device_id}`;
+
+/** Register/upsert the phone's FCM registration token. */
+export async function saveDeviceFcmToken(
+  device_id: string,
+  fcm_token: string
+): Promise<void> {
+  await kv.set(deviceTokenKey(device_id), {
+    fcm_token,
+    updated_at: new Date().toISOString(),
+  });
+}
+
+/** The phone's registered FCM token, or null when none. */
+export async function getDeviceFcmToken(
+  device_id: string
+): Promise<string | null> {
+  const v = (await kv.get(deviceTokenKey(device_id))) as {
+    fcm_token?: unknown;
+  } | null;
+  const t = v?.fcm_token;
+  return typeof t === "string" && t.length > 0 ? t : null;
+}
+
+/** Unregister (KVBackend has no delete — null the record). */
+export async function clearDeviceFcmToken(device_id: string): Promise<void> {
+  await kv.set(deviceTokenKey(device_id), null);
 }
 
 /* ---------------- automation schedule ---------------- */
