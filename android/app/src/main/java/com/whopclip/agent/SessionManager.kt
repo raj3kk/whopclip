@@ -67,8 +67,11 @@ object SessionManager {
 
     private const val KEY_ONLINE = "online"
 
-    /** Local online/offline flag — automation only polls while true. */
-    fun isOnline(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_ONLINE, false)
+    /** Local online/offline flag — automation only polls while true.
+     *  Default true: a paired device polls unless the user explicitly
+     *  tapped Offline. (Fix 2026-09-26: default false meant a fresh pair
+     *  never polled in background until the user found the Online button.) */
+    fun isOnline(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_ONLINE, true)
     fun setOnline(ctx: Context, online: Boolean) {
         prefs(ctx).edit().putBoolean(KEY_ONLINE, online).apply()
     }

@@ -138,7 +138,16 @@ class MainActivity : Activity() {
      * Bilkul silent nahi: user ko toast se pata chalta hai.
      */
     private fun autoStartAutomationIfOnline() {
-        if (!SessionManager.isPaired(this) || !SessionManager.isOnline(this)) return
+        if (!SessionManager.isPaired(this)) return
+        // Safety net (fix 2026-09-26): the 15-min WorkManager backbone is
+        // ALWAYS scheduled for a paired device, even if the user hasn't
+        // tapped Online or the Whop/IG flags aren't set. A paired phone must
+        // never go completely silent — the periodic poll is harmless (just
+        // checks the queue) and jobs fail gracefully without valid sessions.
+        CoroutineScope(Dispatchers.IO).launch {
+            try { PollService.schedulePeriodic(this@MainActivity) } catch (_: Throwable) {}
+        }
+        if (!SessionManager.isOnline(this)) return
         if (!SessionManager.isWhopLinked(this) || !SessionManager.isIgLinked(this)) return
         CoroutineScope(Dispatchers.IO).launch {
             val ok = PollService.startAutomation(this@MainActivity)
