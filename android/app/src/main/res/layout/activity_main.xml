@@ -301,6 +301,121 @@
                     android:text="Server save karo" />
             </LinearLayout>
         </ScrollView>
+
+        <!-- ===== GUIDE TAB ===== -->
+        <ScrollView
+            android:id="@+id/tabGuide"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="📖 WhopClip Guide"
+                    android:textSize="22sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="1️⃣ Pehli baar Setup (Pairing)"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="• Profile tab me jao&#10;• Website se pairing code lo&#10;• Code yahan dalo aur Pair dabao&#10;• Pair hote hi phone server se jud jayega"
+                    android:textSize="15sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="2️⃣ Login karo (Browser tab)"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="• Browser tab kholo&#10;• Whop me login karo&#10;• Instagram me login karo&#10;• Login apne aap save ho jayega — dobara nahi karna padega"
+                    android:textSize="15sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="3️⃣ Online jao"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="• Profile tab me ONLINE button dabao&#10;• &quot;Online ✓&quot; dikhega = kaam shuru&#10;• Ab phone har 15 min me server se kaam lega&#10;• Offline daboge to kaam ruk jayega"
+                    android:textSize="15sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="4️⃣ Job kaise chalti hai"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="• Jab kaam aayega, phone khud utha lega&#10;• Instagram post ke liye APP KO KHULA RAKHO&#10;• App screen par dikhna chahiye (foreground)&#10;• App band/minimize karoge to upload ruk jayega&#10;• Kaam khatam hote hi phone apne aap agli job lega"
+                    android:textSize="15sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="5️⃣ Live tab kya dikhata hai"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="• Abhi kaun si job chal rahi hai&#10;• Kaun sa step chal raha hai&#10;• Pehle ki jobs ka hisaab (history)"
+                    android:textSize="15sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="⚠️ Problem aaye to"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="• Kaam nahi aa raha → App kholo, Profile me ONLINE dabao&#10;• Job atak gayi → App ko foreground me lao (screen par rakho)&#10;• Login expire → Browser tab me dobara login karo&#10;• Battery saver ON hai to OFF karo — nahi to background kaam ruk jayega"
+                    android:textSize="15sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:layout_marginBottom="16dp"
+                    android:text="💡 Yaad rakho: App khula + Online = paisa banega. App band = kaam band."
+                    android:textSize="15sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+        </ScrollView>
     </FrameLayout>
 
     <!-- Bottom tab bar -->
@@ -330,5 +445,12 @@
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="Profile" />
+
+        <Button
+            android:id="@+id/tabBtnGuide"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Guide" />
     </LinearLayout>
 </LinearLayout>

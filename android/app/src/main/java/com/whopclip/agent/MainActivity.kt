@@ -67,6 +67,7 @@ class MainActivity : Activity() {
     private lateinit var tabBrowser: LinearLayout
     private lateinit var tabLive: ScrollView
     private lateinit var tabProfile: ScrollView
+    private lateinit var tabGuide: ScrollView
 
     // Browser tab
     private lateinit var browserWebView: WebView
@@ -103,6 +104,7 @@ class MainActivity : Activity() {
         tabBrowser = findViewById(R.id.tabBrowser)
         tabLive = findViewById(R.id.tabLive)
         tabProfile = findViewById(R.id.tabProfile)
+        tabGuide = findViewById(R.id.tabGuide)
 
         setupBrowserTab()
         setupLiveTab()
@@ -111,6 +113,7 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.tabBtnBrowser).setOnClickListener { showTab(0) }
         findViewById<Button>(R.id.tabBtnLive).setOnClickListener { showTab(1) }
         findViewById<Button>(R.id.tabBtnProfile).setOnClickListener { showTab(2) }
+        findViewById<Button>(R.id.tabBtnGuide).setOnClickListener { showTab(3) }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -183,6 +186,7 @@ class MainActivity : Activity() {
         tabBrowser.visibility = if (idx == 0) View.VISIBLE else View.GONE
         tabLive.visibility = if (idx == 1) View.VISIBLE else View.GONE
         tabProfile.visibility = if (idx == 2) View.VISIBLE else View.GONE
+        tabGuide.visibility = if (idx == 3) View.VISIBLE else View.GONE
         if (idx == 1) { refreshLive(); startLivePoll() } else { stopLivePoll() }
         if (idx == 2) refreshProfile()
     }
