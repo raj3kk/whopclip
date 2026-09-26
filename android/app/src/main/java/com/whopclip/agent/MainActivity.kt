@@ -718,11 +718,10 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Pehle pair karo", Toast.LENGTH_SHORT).show()
             return
         }
-        if (!SessionManager.isWhopLinked(this) || !SessionManager.isIgLinked(this)) {
-            Toast.makeText(this, "Pehle Browser tab me Whop + Instagram login karo",
-                Toast.LENGTH_LONG).show()
-            return
-        }
+        // FIX (2026-09-27): Whop+IG linked gate hataya. Pehle user ko dono
+        // me login karna padta tha Online hone ke liye — jo sirf Instagram
+        // use karta hai wo atak jata tha. Session validity job chalate waqt
+        // check hoti hai, Online hote waqt nahi.
         CoroutineScope(Dispatchers.Main).launch {
             if (online) {
                 // Pehle local automation — fail hua to online state save hi

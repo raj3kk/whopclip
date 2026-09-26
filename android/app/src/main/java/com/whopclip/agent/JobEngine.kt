@@ -15,6 +15,8 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -75,6 +77,15 @@ class JobEngine(private val ctx: Context) {
 
     /** Video URI pre-downloaded from the job's video_url (auto-supplied to file inputs). */
     @Volatile private var pendingVideoUri: Uri? = null
+
+    /**
+     * Current step description, updated BEFORE each step starts.
+     * The concurrent 5-sec screenshot and 30-sec heartbeat loops read this
+     * so the dashboard shows live progress even during long-blocking steps.
+     * (Fix 2026-09-27: previously current_step was only set after a step
+     * completed, so long steps showed nothing.)
+     */
+    @Volatile private var liveStepDesc: String = "starting"
 
     /**
      * Called by JobRunnerActivity.onShowFileChooser. Returns true if the engine
@@ -441,8 +452,50 @@ class JobEngine(private val ctx: Context) {
                     steps.getJSONObject(it).optString("action") == "upload"
                 }
                 pendingVideoUri = if (needsUpload) prepareUploadVideo(job) else null
+
+                // FIX (2026-09-27): concurrent live-reporting loops.
+                // Previously screenshots + heartbeat were sent only AFTER each
+                // step completed — long-blocking steps (goto 45s, wait_text 30s,
+                // upload 90s) produced zero live frames and zero heartbeats.
+                // Now two independent loops run alongside the steps:
+                //  - every 5 sec: capture + upload live screenshot
+                //  - every 30 sec: heartbeat with current step (immediate first)
+                // Both stop in finally. Reporting never fails the job.
+                val liveWv = wv
+                val liveJob = job
+                liveStepDesc = "starting (0/${steps.length()} steps)"
+                setCurrentJob("Chal raha: $jobDesc — starting")
+                val frameLoop = launch(Dispatchers.IO) {
+                    while (isActive) {
+                        try {
+                            uploadLiveFrame(liveJob, liveWv, liveStepDesc)
+                        } catch (_: Exception) { /* never fail the job */ }
+                        kotlinx.coroutines.delay(5000)
+                    }
+                }
+                val beatLoop = launch(Dispatchers.IO) {
+                    // Immediate first heartbeat so the server knows we're alive
+                    try {
+                        if (postHeartbeat(liveJob, liveStepDesc))
+                            throw JobCancelled("owner ne dashboard se cancel kiya")
+                    } catch (e: JobCancelled) { throw e }
+                    catch (_: Exception) { /* never fail the job */ }
+                    while (isActive) {
+                        kotlinx.coroutines.delay(30000)
+                        try {
+                            if (postHeartbeat(liveJob, liveStepDesc))
+                                throw JobCancelled("owner ne dashboard se cancel kiya")
+                        } catch (e: JobCancelled) { throw e }
+                        catch (_: Exception) { /* never fail the job */ }
+                    }
+                }
+                try {
                 for (i in 0 until steps.length()) {
                     val s = steps.getJSONObject(i)
+                    // FIX (2026-09-27): set current step BEFORE it blocks, so
+                    // the concurrent loops report live progress during the step.
+                    liveStepDesc = "step ${i + 1}/${steps.length()}: ${s.optString("action")}"
+                    setCurrentJob("Chal raha: $jobDesc — $liveStepDesc")
                     when (s.optString("action")) {
                         "goto" -> {
                             var url = s.getString("url")
@@ -570,8 +623,15 @@ class JobEngine(private val ctx: Context) {
                     }
                     Log.i(TAG, "step $i ok: ${s.optString("action")}")
                     // Live reporting: heartbeat + live frame after every step.
+                    // (The concurrent 5-sec / 30-sec loops already report during
+                    // the step; this keeps a per-step record too.)
                     // Never fails the job — errors are caught inside.
                     reportLive(job, wv, "step ${i + 1}/${steps.length()}: ${s.optString("action")}")
+                }
+                } finally {
+                    // Stop the concurrent live-reporting loops.
+                    frameLoop.cancel()
+                    beatLoop.cancel()
                 }
             } finally {
                 if (ownsWebView) mainHandler.post { wv.destroy() }
