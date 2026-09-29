@@ -105,3 +105,8 @@ details.job { border: 1px solid var(--border); border-radius: 10px; margin: 8px 
 details.job summary { padding: 12px 14px; cursor: pointer; font-size: 14px; list-style: none; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 details.job summary::-webkit-details-marker { display: none; }
 details.job .body { padding: 0 14px 14px; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}

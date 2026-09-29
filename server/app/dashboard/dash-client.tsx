@@ -580,27 +580,57 @@ export default function Dashboard() {
 
       {tab === "live" && (
         <>
-          <div className="card">
-            <h3 style={{ marginTop: 0 }}>🔴 Live — phone abhi kya kar raha hai</h3>
+          <div className="card" style={{ padding: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <span style={{
+                width: 12, height: 12, borderRadius: "50%", background: "#ff3b30",
+                boxShadow: "0 0 8px #ff3b30", animation: "pulse 1.5s infinite"
+              }} />
+              <h3 style={{ margin: 0 }}>LIVE — agent abhi kya kar raha hai</h3>
+              <span className="muted" style={{ marginLeft: "auto", fontSize: 12 }}>auto-refresh 5s</span>
+            </div>
             {!live ? (
               <p className="muted">Loading…</p>
             ) : !live.live ? (
-              <p className="muted">
-                Abhi koi live frame nahi. Phone jab job chalayega to har step pe uski screen
-                yahan dikhegi (auto-refresh 5s).
-              </p>
+              <div style={{
+                border: "2px dashed #444", borderRadius: 16, padding: "40px 20px",
+                textAlign: "center", color: "#888"
+              }}>
+                <div style={{ fontSize: 40, marginBottom: 8 }}>📱</div>
+                <div>Abhi koi live frame nahi.</div>
+                <div style={{ fontSize: 13, marginTop: 6 }}>
+                  Phone jab job chalayega to uski screen yahan <b>live webview</b> ki tarah dikhegi —
+                  har 5 second me naya screenshot.
+                </div>
+              </div>
             ) : (
               <>
-                <img
-                  key={live.live.updated_at}
-                  src={live.live.frame_url}
-                  alt="phone live screen"
-                  style={{ width: "100%", maxWidth: 340, borderRadius: 12, border: "1px solid #333" }}
-                />
-                <div style={{ marginTop: 10, fontSize: 14 }}>
-                  <b>{live.live.job_type || live.running_job?.type || "job"}</b>
-                  <div style={{ marginTop: 4 }}>📍 {live.live.current_step || live.running_job?.current_step || "…"}</div>
-                  <div className="muted" style={{ marginTop: 4 }}>
+                {/* Phone-frame webview: agent ki live screen */}
+                <div style={{
+                  maxWidth: 380, margin: "0 auto", background: "#111",
+                  borderRadius: 28, padding: "12px 12px 20px",
+                  border: "1px solid #333", boxShadow: "0 8px 32px rgba(0,0,0,0.5)"
+                }}>
+                  <div style={{
+                    display: "flex", alignItems: "center", gap: 8,
+                    padding: "4px 8px 10px", color: "#aaa", fontSize: 12
+                  }}>
+                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#30d158" }} />
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {live.live.job_type || live.running_job?.type || "agent webview"}
+                    </span>
+                    <span style={{ marginLeft: "auto" }}>🔴 LIVE</span>
+                  </div>
+                  <img
+                    key={live.live.updated_at}
+                    src={live.live.frame_url}
+                    alt="agent live screen"
+                    style={{ width: "100%", borderRadius: 16, display: "block", background: "#000" }}
+                  />
+                </div>
+                <div style={{ marginTop: 12, fontSize: 14, textAlign: "center" }}>
+                  <div style={{ fontSize: 16 }}>📍 <b>{live.live.current_step || live.running_job?.current_step || "…"}</b></div>
+                  <div className="muted" style={{ marginTop: 4, fontSize: 12 }}>
                     frame: {timeAgo(live.live.updated_at)}
                     {(Date.now() - new Date(live.live.updated_at).getTime() > 120000) && " ⚠️ stale — phone ka heartbeat ruka lagta hai"}
                   </div>
@@ -608,7 +638,7 @@ export default function Dashboard() {
               </>
             )}
             {live?.running_job && (
-              <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
+              <div className="muted" style={{ marginTop: 10, fontSize: 13, textAlign: "center" }}>
                 running job: <code>{live.running_job.id.slice(0, 8)}</code> · {live.running_job.steps_total} steps ·
                 heartbeat #{live.running_job.heartbeat_count}
                 {live.running_job.last_heartbeat ? ` · last ${timeAgo(live.running_job.last_heartbeat)}` : " · heartbeat abhi tak nahi"}
