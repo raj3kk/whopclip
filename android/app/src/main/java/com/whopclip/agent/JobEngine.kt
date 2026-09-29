@@ -415,6 +415,7 @@ class JobEngine(private val ctx: Context) {
             val extracted = JSONObject()
             val steps: JSONArray = job.optJSONArray("steps") ?: JSONArray()
             val ownsWebView = externalWebView == null
+            var usesLiveWebView = false
             val jobDesc = "${job.optString("type", "job")} ${job.optString("id", "").take(8)}"
             setCurrentJob("Chal raha: $jobDesc (${steps.length()} steps)")
             Log.i(TAG, "job start: $jobDesc")
@@ -428,15 +429,25 @@ class JobEngine(private val ctx: Context) {
                 }
                 externalWebView
             } else {
+                // FIX (2026-09-29): Pehle MainActivity ke Live tab ka WebView try karo
+                // taaki user ko agent ka REAL browser live dikhe (screenshot nahi).
+                // Agar Activity alive nahi (background worker), to headless fallback.
                 var created: WebView? = null
                 suspendCancellableCoroutine<Unit> { cont ->
                     mainHandler.post {
-                        val wv2 = makeWebView()
-                        // Headless WebView ko viewport do taaki live frames
-                        // aur verify screenshots ka size real ho (bina layout
-                        // ke width/height 0 hote hain).
-                        wv2.layout(0, 0, 480, 854)
-                        created = wv2
+                        val liveWv = try { MainActivity.liveWebView } catch (_: Exception) { null }
+                        if (liveWv != null) {
+                            liveWv.addJavascriptInterface(JsBridge(), "WhopClip")
+                            created = liveWv
+                            usesLiveWebView = true
+                        } else {
+                            val wv2 = makeWebView()
+                            // Headless WebView ko viewport do taaki live frames
+                            // aur verify screenshots ka size real ho (bina layout
+                            // ke width/height 0 hote hain).
+                            wv2.layout(0, 0, 480, 854)
+                            created = wv2
+                        }
                         cont.resume(Unit)
                     }
                 }
@@ -444,23 +455,11 @@ class JobEngine(private val ctx: Context) {
             }
 
             try {
-                // Pre-download the orchestrator-provided video so file inputs can
-                // be auto-filled without the system picker (see handleFileChooser).
-                // Only when the job actually has an upload step — skip the
-                // download for pure browsing/click jobs.
-                val needsUpload = (0 until steps.length()).any {
-                    steps.getJSONObject(it).optString("action") == "upload"
-                }
-                pendingVideoUri = if (needsUpload) prepareUploadVideo(job) else null
-
-                // FIX (2026-09-27): concurrent live-reporting loops.
-                // Previously screenshots + heartbeat were sent only AFTER each
-                // step completed — long-blocking steps (goto 45s, wait_text 30s,
-                // upload 90s) produced zero live frames and zero heartbeats.
-                // Now two independent loops run alongside the steps:
-                //  - every 5 sec: capture + upload live screenshot
-                //  - every 30 sec: heartbeat with current step (immediate first)
-                // Both stop in finally. Reporting never fails the job.
+                // FIX (2026-09-29): Start live-reporting loops BEFORE the video
+                // download. Previously prepareUploadVideo() ran before the loops —
+                // a slow/hung download meant zero heartbeats, zero frames, zero
+                // steps: job showed "running" but nothing happened. Now the loops
+                // start first, so the server always sees we're alive.
                 val liveWv = wv
                 val liveJob = job
                 liveStepDesc = "starting (0/${steps.length()} steps)"
@@ -489,6 +488,23 @@ class JobEngine(private val ctx: Context) {
                         catch (_: Exception) { /* never fail the job */ }
                     }
                 }
+
+                // Pre-download the orchestrator-provided video so file inputs can
+                // be auto-filled without the system picker (see handleFileChooser).
+                // Only when the job actually has an upload step — skip the
+                // download for pure browsing/click jobs. Runs AFTER loops start
+                // so a slow download never silences heartbeats/frames.
+                val needsUpload = (0 until steps.length()).any {
+                    steps.getJSONObject(it).optString("action") == "upload"
+                }
+                if (needsUpload) {
+                    liveStepDesc = "video download ho raha hai..."
+                    setCurrentJob("Chal raha: $jobDesc — video download")
+                    pendingVideoUri = prepareUploadVideo(job)
+                } else {
+                    pendingVideoUri = null
+                }
+
                 try {
                 for (i in 0 until steps.length()) {
                     val s = steps.getJSONObject(i)
@@ -600,7 +616,8 @@ class JobEngine(private val ctx: Context) {
                             // Headless PollWorker has no activity/file-picker: fail
                             // fast so the job is requeued and the user is notified
                             // (no pointless 90s wait here).
-                            if (ownsWebView)
+                            // Live WebView use ho raha hai to app already foreground me hai.
+                            if (ownsWebView && !usesLiveWebView)
                                 throw JobFailed("needs_foreground: upload needs the app open (file picker)")
                             // Arm BEFORE the JS click: the auto-supply path in
                             // onShowFileChooser -> handleFileChooser signals the
@@ -634,7 +651,8 @@ class JobEngine(private val ctx: Context) {
                     beatLoop.cancel()
                 }
             } finally {
-                if (ownsWebView) mainHandler.post { wv.destroy() }
+                // Live WebView ko destroy mat karo — wo MainActivity ka hai.
+                if (ownsWebView && !usesLiveWebView) mainHandler.post { wv.destroy() }
                 setCurrentJob(null)
                 Log.i(TAG, "job done: $jobDesc")
             }

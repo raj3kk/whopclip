@@ -18,6 +18,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -62,6 +63,12 @@ class MainActivity : Activity() {
         private const val WHOP_URL = "https://whop.com/"
         private const val IG_URL = "https://www.instagram.com/"
         private const val GOOGLE_SEARCH = "https://www.google.com/search?q="
+        /**
+         * Live tab ka WebView — JobEngine isko use karta hai taaki user ko
+         * agent ka REAL browser live dikhe (screenshot nahi, asli WebView).
+         * MainActivity alive nahi hai to null (headless fallback).
+         */
+        @Volatile var liveWebView: WebView? = null
     }
 
     private lateinit var tabBrowser: LinearLayout
@@ -78,6 +85,7 @@ class MainActivity : Activity() {
     private lateinit var liveStatusText: TextView
     private lateinit var liveJobText: TextView
     private lateinit var liveFrameImg: ImageView
+    private lateinit var liveWebViewContainer: FrameLayout
     private lateinit var liveHistoryText: TextView
     private var livePoll: Job? = null
 
@@ -391,8 +399,28 @@ class MainActivity : Activity() {
         liveStatusText = findViewById(R.id.liveStatusText)
         liveJobText = findViewById(R.id.liveJobText)
         liveFrameImg = findViewById(R.id.liveFrameImg)
+        liveWebViewContainer = findViewById(R.id.liveWebViewContainer)
         liveHistoryText = findViewById(R.id.liveHistoryText)
         findViewById<Button>(R.id.liveRefreshBtn).setOnClickListener { refreshLive() }
+        // Live WebView: agent ka REAL browser yahan dikhega (screenshot nahi).
+        // JobEngine isko use karega jab job chalega.
+        val wv = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.mediaPlaybackRequiresUserGesture = false
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        }
+        liveWebViewContainer.addView(wv)
+        liveWebView = wv
+    }
+
+    override fun onDestroy() {
+        liveWebView?.destroy()
+        liveWebView = null
+        super.onDestroy()
     }
 
     /**
